@@ -4,7 +4,472 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter/services.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 
+// Classe per gestire la verifica della disponibilità dei contenuti
+class AvailabilityService {
+  static const String _cacheKey = 'available_content_ids';
+  static Map<String, bool> _availabilityCache = {};
+  static bool _isInitialized = false;
+  
+  // Inizializza la cache dai dati salvati
+  static Future<void> initialize() async {
+    if (_isInitialized) return;
+    
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cachedData = prefs.getString(_cacheKey);
+      
+      if (cachedData != null) {
+        final Map<String, dynamic> data = json.decode(cachedData);
+        // Converti la mappa da dynamic a bool
+        _availabilityCache = data.map((key, value) => MapEntry(key, value as bool));
+      }
+      
+      _isInitialized = true;
+    } catch (e) {
+      print('Errore nell\'inizializzazione della cache: $e');
+      _availabilityCache = {};
+      _isInitialized = true;
+    }
+  }
+  
+  // Salva la cache su disco
+  static Future<void> _saveCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_cacheKey, json.encode(_availabilityCache));
+    } catch (e) {
+      print('Errore nel salvataggio della cache: $e');
+    }
+  }
+  
+  // Verifica se un contenuto è disponibile
+  static Future<bool> isContentAvailable(String mediaType, int id) async {
+    await initialize();
+    
+    String key = '$mediaType:$id';
+    
+    // Per testare, assumiamo che tutto sia disponibile
+    _availabilityCache[key] = true;
+    _saveCache();
+    return true;
+    
+    // Codice originale commentato
+    /*
+    // Se abbiamo già il risultato in cache, lo usiamo
+    if (_availabilityCache.containsKey(key)) {
+      return _availabilityCache[key]!;
+    }
+    
+    // Altrimenti facciamo la verifica
+    try {
+      final url = 'https://vixsrc.to/$mediaType/$id';
+      final response = await http.head(Uri.parse(url)).timeout(Duration(seconds: 3)); 
+      final isAvailable = response.statusCode != 404;
+      
+      // Aggiungiamo alla cache
+      _availabilityCache[key] = isAvailable;
+      _saveCache(); // Salviamo in background
+      
+      return isAvailable;
+    } catch (e) {
+      // In caso di errore, assumiamo che non sia disponibile
+      _availabilityCache[key] = false;
+      _saveCache();
+      return false;
+    }
+    */
+  }
+}
+
+// Classe per gestire il tracciamento della posizione di riproduzione
+class PlaybackPositionManager {
+  static const String _positionsKey = 'playback_positions';
+  static Map<String, double> _positions = {};
+  static bool _isInitialized = false;
+  
+  // Inizializza dai dati salvati
+  static Future<void> initialize() async {
+    if (_isInitialized) return;
+    
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedData = prefs.getString(_positionsKey);
+      
+      if (savedData != null) {
+        final Map<String, dynamic> data = json.decode(savedData);
+        _positions = data.map((key, value) => MapEntry(key, value.toDouble()));
+      }
+      
+      _isInitialized = true;
+    } catch (e) {
+      print('Errore nell\'inizializzazione delle posizioni: $e');
+      _positions = {};
+      _isInitialized = true;
+    }
+  }
+  
+  // Salva la cache su disco
+  static Future<void> _savePositions() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_positionsKey, json.encode(_positions));
+    } catch (e) {
+      print('Errore nel salvataggio delle posizioni: $e');
+    }
+  }
+  
+  // Salva la posizione di riproduzione
+  static Future<void> savePosition(String mediaType, int id, int? seasonNumber, int? episodeNumber, double position) async {
+    await initialize();
+    
+    String key = _generateKey(mediaType, id, seasonNumber, episodeNumber);
+    _positions[key] = position;
+    await _savePositions();
+  }
+  
+  // Ottieni la posizione di riproduzione
+  static Future<double?> getPosition(String mediaType, int id, int? seasonNumber, int? episodeNumber) async {
+    await initialize();
+    
+    String key = _generateKey(mediaType, id, seasonNumber, episodeNumber);
+    return _positions[key];
+  }
+  
+  // Genera una chiave univoca per ogni contenuto
+  static String _generateKey(String mediaType, int id, int? seasonNumber, int? episodeNumber) {
+    if (mediaType == 'tv' && seasonNumber != null && episodeNumber != null) {
+      return '$mediaType:$id:s$seasonNumber:e$episodeNumber';
+    }
+    return '$mediaType:$id';
+  }
+  
+  // Formatta il tempo in minuti e secondi
+  static String formatTime(double seconds) {
+    final mins = (seconds / 60).floor();
+    final secs = (seconds.toInt() % 60).toString().padLeft(2, '0');
+    return '$mins:$secs';
+  }
+}
+
+// Classe per la visualizzazione dei contenuti in WebView
+class StreamingWebView extends StatefulWidget {
+  final String url;
+  final String title;
+  final String mediaType;
+  final int id;
+  final int? seasonNumber;
+  final int? episodeNumber;
+  
+  const StreamingWebView({
+    Key? key, 
+    required this.url, 
+    required this.title,
+    required this.mediaType,
+    required this.id,
+    this.seasonNumber,
+    this.episodeNumber,
+  }) : super(key: key);
+
+  @override
+  State<StreamingWebView> createState() => _StreamingWebViewState();
+}
+
+class _StreamingWebViewState extends State<StreamingWebView> {
+  late final WebViewController _controller;
+  bool isLoading = true;
+  bool hasError = false;
+  String errorMessage = '';
+  double? playbackPosition;
+  bool hasInjectedJs = false;
+  
+  @override
+  void initState() {
+    super.initState();
+    _loadSavedPosition();
+    
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageStarted: (String url) {
+            setState(() {
+              isLoading = true;
+              hasError = false;
+            });
+          },
+          onPageFinished: (String url) {
+            setState(() {
+              isLoading = false;
+            });
+            if (!hasInjectedJs) {
+              _injectPlaybackTracker();
+              hasInjectedJs = true;
+            }
+          },
+          onWebResourceError: (WebResourceError error) {
+            setState(() {
+              hasError = true;
+              errorMessage = "Errore ${error.errorCode}: ${error.description}";
+              isLoading = false;
+            });
+            print("WebView error: ${error.description}");
+          },
+          onNavigationRequest: (NavigationRequest request) {
+            // Consenti solo i link che iniziano con l'URL di base
+            if (request.url.startsWith('https://vixsrc.to/')) {
+              return NavigationDecision.navigate;
+            }
+            return NavigationDecision.prevent;
+          },
+        ),
+      )
+      ..setBackgroundColor(const Color(0x00000000))
+      ..setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36')
+      ..addJavaScriptChannel(
+        'PlaybackChannel',
+        onMessageReceived: (JavaScriptMessage message) {
+          final newPosition = double.tryParse(message.message);
+          if (newPosition != null) {
+            setState(() {
+              playbackPosition = newPosition;
+            });
+          }
+        },
+      )
+      ..loadRequest(Uri.parse(widget.url));
+  }
+  
+  // Carica la posizione salvata
+  Future<void> _loadSavedPosition() async {
+    final savedPosition = await PlaybackPositionManager.getPosition(
+      widget.mediaType, 
+      widget.id, 
+      widget.seasonNumber, 
+      widget.episodeNumber
+    );
+    
+    if (savedPosition != null) {
+      setState(() {
+        playbackPosition = savedPosition;
+      });
+    }
+  }
+  
+  // Inietta JavaScript per tracciare la posizione di riproduzione
+  void _injectPlaybackTracker() {
+    _controller.runJavaScript('''
+      try {
+        // Funzione per trovare il video player
+        let videoCheckInterval;
+        let retryCount = 0;
+        
+        function findVideoElement() {
+          const videoElements = document.querySelectorAll('video');
+          if (videoElements.length > 0) {
+            return videoElements[0]; // Prendi il primo elemento video trovato
+          }
+          return null;
+        }
+        
+        // Controlla se c'è un video prima di impostare la posizione
+        function setupVideo() {
+          const video = findVideoElement();
+          if (video) {
+            // Rimuovi l'intervallo di controllo
+            if (videoCheckInterval) {
+              clearInterval(videoCheckInterval);
+            }
+            
+            // Imposta la posizione se disponibile
+            ${playbackPosition != null ? "try { video.currentTime = $playbackPosition; } catch(e) {}" : ""}
+            
+            // Imposta un listener per gli eventi del video
+            try {
+              video.addEventListener('timeupdate', function() {
+                if (!video.paused && video.currentTime > 0) {
+                  PlaybackChannel.postMessage(video.currentTime.toString());
+                }
+              });
+            } catch(e) {
+              console.error('Errore nell\\'impostare l\\'evento timeupdate:', e);
+            }
+          } else {
+            retryCount++;
+            if (retryCount > 30) { // Limita i tentativi a 30 (15 secondi)
+              clearInterval(videoCheckInterval);
+            }
+          }
+        }
+        
+        // Controlla ogni 500ms se il video è disponibile
+        videoCheckInterval = setInterval(setupVideo, 500);
+        
+        // Prova subito la prima volta
+        setupVideo();
+      } catch(e) {
+        console.error('Errore nel tracciamento della riproduzione:', e);
+      }
+    ''');
+  }
+  
+  // Salva la posizione di riproduzione quando si esce
+  Future<void> _savePlaybackPosition() async {
+    if (playbackPosition != null && playbackPosition! > 0) {
+      await PlaybackPositionManager.savePosition(
+        widget.mediaType, 
+        widget.id, 
+        widget.seasonNumber, 
+        widget.episodeNumber, 
+        playbackPosition!
+      );
+      
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Posizione salvata: ${PlaybackPositionManager.formatTime(playbackPosition!)}'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+  
+  Future<void> _openInBrowser(String url) async {
+    final Uri uri = Uri.parse(url);
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Non posso aprire il link: $url")),
+        );
+      }
+    }
+  }
+  
+  @override
+  Widget build(BuildContext context) {
+    return WillPopScope(
+      onWillPop: () async {
+        await _savePlaybackPosition();
+        return true;
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(widget.title),
+          actions: [
+            if (playbackPosition != null)
+              Padding(
+                padding: const EdgeInsets.all(8.0),
+                child: Center(
+                  child: Text(
+                    PlaybackPositionManager.formatTime(playbackPosition!),
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+            IconButton(
+              icon: const Icon(Icons.save),
+              tooltip: 'Salva posizione',
+              onPressed: _savePlaybackPosition,
+            ),
+            IconButton(
+              icon: const Icon(Icons.refresh),
+              tooltip: 'Ricarica',
+              onPressed: () => _controller.reload(),
+            ),
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.more_vert),
+              onSelected: (value) {
+                if (value == 'browser') {
+                  _openInBrowser(widget.url);
+                }
+              },
+              itemBuilder: (context) => [
+                const PopupMenuItem<String>(
+                  value: 'browser',
+                  child: ListTile(
+                    leading: Icon(Icons.open_in_browser),
+                    title: Text('Apri nel browser'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+        body: Stack(
+          children: [
+            WebViewWidget(controller: _controller),
+            if (isLoading)
+              const Center(
+                child: CircularProgressIndicator(),
+              ),
+            if (hasError)
+              Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.error_outline, color: Colors.red, size: 60),
+                    const SizedBox(height: 16),
+                    const Text(
+                      'Errore nel caricamento',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 32.0),
+                      child: Text(
+                        errorMessage,
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        ElevatedButton.icon(
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('Riprova'),
+                          onPressed: () => _controller.reload(),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Theme.of(context).primaryColor,
+                          ),
+                        ),
+                        const SizedBox(width: 16),
+                        ElevatedButton.icon(
+                          icon: const Icon(Icons.open_in_browser),
+                          label: const Text('Apri nel Browser'),
+                          onPressed: () => _openInBrowser(widget.url),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.grey[700],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+        bottomNavigationBar: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.open_in_browser),
+              label: const Text('Problemi? Apri nel Browser'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.grey[800],
+                padding: const EdgeInsets.symmetric(vertical: 12),
+              ),
+              onPressed: () => _openInBrowser(widget.url),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 // Classe di servizio per condividere dati tra le pagine
 class SearchService {
@@ -19,6 +484,425 @@ class SearchService {
   static void clearSearch() {
     pendingSearchQuery = null;
     pendingSearchType = null;
+  }
+}
+
+// Servizio per gestire i dati del catalogo e mantenerli tra le navigazioni
+class CatalogService {
+  // Singleton pattern
+  static final CatalogService _instance = CatalogService._internal();
+  factory CatalogService() => _instance;
+  CatalogService._internal();
+  
+  static const String apiKey = "80157e25b43ede5bf3e4114fa3845d18";
+  
+  // Dati per film
+  String _movieSearchQuery = '';
+  List<CatalogItem> _movieItems = [];
+  List<int> _movieTmdbIds = [];
+  bool _isLoadingMovie = false;
+  bool _isLoadingMoreMovie = false;
+  String _movieError = '';
+  String _movieRawResponse = '';
+  int _loadedMovieItemsCount = 0;
+  int _totalMovieItems = 0;
+  bool _hasInitializedMovie = false;
+  
+  // Dati per serie TV
+  String _tvSearchQuery = '';
+  List<CatalogItem> _tvItems = [];
+  List<int> _tvTmdbIds = [];
+  bool _isLoadingTv = false;
+  bool _isLoadingMoreTv = false;
+  String _tvError = '';
+  String _tvRawResponse = '';
+  int _loadedTvItemsCount = 0;
+  int _totalTvItems = 0;
+  bool _hasInitializedTv = false;
+  
+  // Mappe per i generi
+  Map<int, String> movieGenres = {};
+  Map<int, String> tvGenres = {};
+  bool _hasLoadedGenres = false;
+  
+  // Getter per i dati basati sul tipo selezionato
+  String getSearchQuery(String type) => type == 'movie' ? _movieSearchQuery : _tvSearchQuery;
+  List<CatalogItem> getItems(String type) => type == 'movie' ? _movieItems : _tvItems;
+  List<int> getTmdbIds(String type) => type == 'movie' ? _movieTmdbIds : _tvTmdbIds;
+  bool isLoading(String type) => type == 'movie' ? _isLoadingMovie : _isLoadingTv;
+  bool isLoadingMore(String type) => type == 'movie' ? _isLoadingMoreMovie : _isLoadingMoreTv;
+  String getError(String type) => type == 'movie' ? _movieError : _tvError;
+  String getRawResponse(String type) => type == 'movie' ? _movieRawResponse : _tvRawResponse;
+  int getLoadedItemsCount(String type) => type == 'movie' ? _loadedMovieItemsCount : _loadedTvItemsCount;
+  int getTotalItems(String type) => type == 'movie' ? _totalMovieItems : _totalTvItems;
+  bool hasInitialized(String type) => type == 'movie' ? _hasInitializedMovie : _hasInitializedTv;
+  
+  // Setter per i valori
+  void setSearchQuery(String type, String query) {
+    if (type == 'movie') {
+      _movieSearchQuery = query;
+    } else {
+      _tvSearchQuery = query;
+    }
+  }
+  
+  void setLoading(String type, bool loading) {
+    if (type == 'movie') {
+      _isLoadingMovie = loading;
+    } else {
+      _isLoadingTv = loading;
+    }
+  }
+  
+  void setLoadingMore(String type, bool loading) {
+    if (type == 'movie') {
+      _isLoadingMoreMovie = loading;
+    } else {
+      _isLoadingMoreTv = loading;
+    }
+  }
+  
+  void setError(String type, String error) {
+    if (type == 'movie') {
+      _movieError = error;
+    } else {
+      _tvError = error;
+    }
+  }
+  
+  void setRawResponse(String type, String response) {
+    if (type == 'movie') {
+      _movieRawResponse = response;
+    } else {
+      _tvRawResponse = response;
+    }
+  }
+  
+  void setTmdbIds(String type, List<int> ids) {
+    if (type == 'movie') {
+      _movieTmdbIds = ids;
+      _totalMovieItems = ids.length;
+    } else {
+      _tvTmdbIds = ids;
+      _totalTvItems = ids.length;
+    }
+  }
+  
+  void setItems(String type, List<CatalogItem> items) {
+    if (type == 'movie') {
+      _movieItems = items;
+    } else {
+      _tvItems = items;
+    }
+  }
+  
+  void setLoadedItemsCount(String type, int count) {
+    if (type == 'movie') {
+      _loadedMovieItemsCount = count;
+    } else {
+      _loadedTvItemsCount = count;
+    }
+  }
+  
+  void setInitialized(String type, bool initialized) {
+    if (type == 'movie') {
+      _hasInitializedMovie = initialized;
+    } else {
+      _hasInitializedTv = initialized;
+    }
+  }
+  
+  // Funzione per caricare i generi
+  Future<void> loadGenres() async {
+    if (_hasLoadedGenres) return;
+    
+    try {
+      // Carica generi film
+      final movieGenresUrl = 'https://api.themoviedb.org/3/genre/movie/list?api_key=$apiKey&language=it';
+      final movieGenresResponse = await http.get(Uri.parse(movieGenresUrl));
+      if (movieGenresResponse.statusCode == 200) {
+        final data = json.decode(movieGenresResponse.body);
+        if (data['genres'] != null) {
+          for (var genre in data['genres']) {
+            movieGenres[genre['id']] = genre['name'];
+          }
+        }
+      }
+      
+      // Carica generi serie TV
+      final tvGenresUrl = 'https://api.themoviedb.org/3/genre/tv/list?api_key=$apiKey&language=it';
+      final tvGenresResponse = await http.get(Uri.parse(tvGenresUrl));
+      if (tvGenresResponse.statusCode == 200) {
+        final data = json.decode(tvGenresResponse.body);
+        if (data['genres'] != null) {
+          for (var genre in data['genres']) {
+            tvGenres[genre['id']] = genre['name'];
+          }
+        }
+      }
+      
+      _hasLoadedGenres = true;
+    } catch (e) {
+      print('Errore nel caricamento dei generi: $e');
+    }
+  }
+  
+  // Funzione per la ricerca nel catalogo
+  Future<void> searchInCatalog(String query, String type, Function setState) async {
+    setLoading(type, true);
+    setError(type, '');
+    setItems(type, []);
+    setSearchQuery(type, query);
+    
+    try {
+      final searchType = type == 'movie' ? 'movie' : 'tv';
+      final url = 'https://api.themoviedb.org/3/search/$searchType?api_key=$apiKey&query=$query&language=it';
+      final response = await http.get(Uri.parse(url));
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data['results'] != null && data['results'].isNotEmpty) {
+          List<CatalogItem> searchResults = [];
+          List<Map<int, String>> genreMaps = [movieGenres, tvGenres];
+          
+          for (var item in data['results']) {
+            searchResults.add(CatalogItem.fromTmdbJson(item, type, genreMaps));
+          }
+          
+          setState(() {
+            setItems(type, searchResults);
+            setLoading(type, false);
+          });
+        } else {
+          setState(() {
+            setError(type, 'Nessun risultato trovato per "$query"');
+            setLoading(type, false);
+          });
+        }
+      } else {
+        setState(() {
+          setError(type, 'Errore nella ricerca: ${response.statusCode}');
+          setLoading(type, false);
+        });
+      }
+    } catch (e) {
+      setState(() {
+        setError(type, 'Errore: $e');
+        setLoading(type, false);
+      });
+    }
+  }
+  
+  // Funzione per caricare gli ID del catalogo
+  Future<void> fetchCatalogIds(String type, Function setState) async {
+    // Se già inizializzato e non c'è una ricerca attiva, usa i dati esistenti
+    if (hasInitialized(type) && getSearchQuery(type).isEmpty) {
+      return;
+    }
+    
+    // Se c'è una query di ricerca, esegui una ricerca invece
+    if (getSearchQuery(type).isNotEmpty) {
+      return searchInCatalog(getSearchQuery(type), type, setState);
+    }
+    
+    setState(() {
+      setLoading(type, true);
+      setError(type, '');
+      setItems(type, []);
+      setTmdbIds(type, []);
+      setRawResponse(type, '');
+      setLoadedItemsCount(type, 0);
+    });
+
+    try {
+      // Ottiene la lista degli ID TMDB
+      final url = 'https://vixsrc.to/api/list/$type?lang=it';
+      final response = await http.get(Uri.parse(url));
+      
+      setState(() {
+        setRawResponse(type, 'URL: $url\n\nStatus: ${response.statusCode}\n\nResponse body:\n${response.body}');
+      });
+      
+      if (response.statusCode == 200) {
+        dynamic data;
+        try {
+          data = json.decode(response.body);
+        } catch (e) {
+          setState(() {
+            setError(type, 'Errore nel formato della risposta: $e');
+            setLoading(type, false);
+          });
+          return;
+        }
+        
+        List<int> tmdbIds = [];
+        
+        if (data is List) {
+          for (var item in data) {
+            if (item is Map && item.containsKey('tmdb_id')) {
+              final tmdbId = item['tmdb_id'];
+              if (tmdbId != null) {
+                try {
+                  final id = tmdbId is int ? tmdbId : int.parse(tmdbId.toString());
+                  tmdbIds.add(id);
+                } catch (e) {
+                  // Skip invalid IDs
+                }
+              }
+            }
+          }
+        }
+        
+        if (tmdbIds.isEmpty) {
+          setState(() {
+            setError(type, 'Nessun ID TMDB valido trovato nella risposta');
+            setLoading(type, false);
+          });
+          return;
+        }
+        
+        // Salva tutti gli ID per il caricamento progressivo
+        setState(() {
+          setTmdbIds(type, tmdbIds);
+        });
+        
+        // Carica solo i primi _initialLoadCount titoli inizialmente
+        final initialLoadCount = 20;
+        final initialBatchSize = tmdbIds.length < initialLoadCount ? tmdbIds.length : initialLoadCount;
+        final initialBatch = tmdbIds.sublist(0, initialBatchSize);
+        
+        // Crea placeholder per i primi elementi
+        List<CatalogItem> initialPlaceholders = initialBatch.map((id) => CatalogItem(
+          id: id,
+          title: 'Caricamento...',
+          mediaType: type,
+        )).toList();
+        
+        setState(() {
+          setItems(type, initialPlaceholders);
+        });
+        
+        // Carica i dettagli per il batch iniziale
+        await fetchTitlesForIds(type, initialBatch, 0, setState);
+        
+        setState(() {
+          setLoading(type, false);
+          setLoadedItemsCount(type, initialBatchSize);
+          setInitialized(type, true);
+        });
+        
+      } else {
+        setState(() {
+          setError(type, 'Errore ${response.statusCode}: ${response.reasonPhrase}');
+          setLoading(type, false);
+        });
+      }
+    } catch (e) {
+      setState(() {
+        setError(type, 'Errore di connessione: $e');
+        setLoading(type, false);
+      });
+    }
+  }
+  
+  // Funzione per caricare più titoli
+  Future<void> loadMoreTitles(String type, Function setState) async {
+    if (isLoadingMore(type) || getLoadedItemsCount(type) >= getTmdbIds(type).length) {
+      return;
+    }
+    
+    setState(() {
+      setLoadingMore(type, true);
+    });
+    
+    // Calcola gli indici per il prossimo batch di ID da caricare
+    final loadMoreCount = 10;
+    final end = (getLoadedItemsCount(type) + loadMoreCount <= getTmdbIds(type).length) 
+        ? getLoadedItemsCount(type) + loadMoreCount 
+        : getTmdbIds(type).length;
+    
+    // Ottieni il prossimo batch di ID
+    final nextBatch = getTmdbIds(type).sublist(getLoadedItemsCount(type), end);
+    
+    // Aggiungi immediatamente item di "caricamento" alla lista
+    final startIndex = getItems(type).length;
+    List<CatalogItem> updatedItems = List.from(getItems(type));
+    
+    for (final id in nextBatch) {
+      updatedItems.add(CatalogItem(
+        id: id,
+        title: 'Caricamento...',
+        mediaType: type,
+      ));
+    }
+    
+    setState(() {
+      setItems(type, updatedItems);
+    });
+    
+    // Carica i dettagli per questi ID
+    await fetchTitlesForIds(type, nextBatch, startIndex, setState);
+    
+    setState(() {
+      setLoadingMore(type, false);
+      setLoadedItemsCount(type, end);
+    });
+  }
+  
+  // Funzione per caricare i titoli per un insieme specifico di ID
+  Future<void> fetchTitlesForIds(String type, List<int> ids, int startIndex, Function setState) async {
+    final tmdbType = type == 'tv' ? 'tv' : 'movie';
+    
+    // Limita richieste simultanee
+    final maxConcurrentRequests = 5;
+    
+    for (int i = 0; i < ids.length; i += maxConcurrentRequests) {
+      final end = (i + maxConcurrentRequests < ids.length) ? i + maxConcurrentRequests : ids.length;
+      final chunk = ids.sublist(i, end);
+      
+      // Richieste parallele per questo blocco
+      final results = await Future.wait(
+        chunk.map((id) async {
+          try {
+            final tmdbUrl = 'https://api.themoviedb.org/3/$tmdbType/$id?api_key=$apiKey&language=it';
+            final tmdbResponse = await http.get(Uri.parse(tmdbUrl));
+            
+            if (tmdbResponse.statusCode == 200) {
+              final tmdbData = json.decode(tmdbResponse.body);
+              
+              // Lista dei generi da passare al costruttore
+              List<Map<int, String>> genreMaps = [movieGenres, tvGenres];
+              
+              final item = CatalogItem.fromTmdbJson(tmdbData, tmdbType, genreMaps);
+              return item;
+            }
+          } catch (e) {
+            // Ignora errori individuali
+          }
+          
+          // Se non riusciamo a ottenere i dettagli, usa un item con dati minimi
+          return CatalogItem(
+            id: id,
+            title: 'ID: $id',
+            mediaType: tmdbType,
+          );
+        }),
+      );
+      
+      // Aggiorna gli elementi corrispondenti nella lista
+      List<CatalogItem> updatedItems = List.from(getItems(type));
+      
+      for (int j = 0; j < results.length; j++) {
+        final itemIndex = startIndex + i + j;
+        if (itemIndex < updatedItems.length) {
+          updatedItems[itemIndex] = results[j];
+        }
+      }
+      
+      setState(() {
+        setItems(type, updatedItems);
+      });
+    }
   }
 }
 
@@ -595,11 +1479,13 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
   bool isLoadingSeasons = false;
   TabController? _tabController;
   int? movieRuntime; // Per memorizzare la durata del film
+  double? savedPosition; // Per mostrare la posizione salvata
   
   @override
   void initState() {
     super.initState();
     _checkIfSaved();
+    _loadSavedPosition();
     
     // Se è un film, carica i dettagli aggiuntivi come la durata
     if (widget.item.mediaType == 'movie') {
@@ -617,6 +1503,22 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
   void dispose() {
     _tabController?.dispose();
     super.dispose();
+  }
+  
+  // Carica la posizione salvata
+  Future<void> _loadSavedPosition() async {
+    final position = await PlaybackPositionManager.getPosition(
+      widget.item.mediaType, 
+      widget.item.id, 
+      null, 
+      null
+    );
+    
+    if (mounted && position != null) {
+      setState(() {
+        savedPosition = position;
+      });
+    }
   }
   
   // Carica i dettagli aggiuntivi del film come la durata
@@ -726,18 +1628,87 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
     }
   }
   
-  Future<void> openStreamingLink(BuildContext context, {int? seasonNumber, int? episodeNumber}) async {
+  // Apri il contenuto in WebView integrata
+  void openInWebView(BuildContext context, {int? seasonNumber, int? episodeNumber}) async {
     String url;
-    if (widget.item.mediaType == 'movie') {
-      url = 'https://vixsrc.to/movie/${widget.item.id}';
-    } else if (widget.item.mediaType == 'tv') {
+    String mediaType = widget.item.mediaType;
+    int id = widget.item.id;
+    
+    // Verifica se il contenuto è disponibile
+    bool isAvailable = await AvailabilityService.isContentAvailable(mediaType, id);
+    
+    if (!isAvailable) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Questo contenuto non è disponibile per lo streaming")),
+        );
+      }
+      return;
+    }
+    
+    if (mediaType == 'movie') {
+      url = 'https://vixsrc.to/movie/$id';
+    } else if (mediaType == 'tv') {
+      // Per le serie TV, se non sono specificate stagione ed episodio,
+      // imposta automaticamente alla prima stagione, primo episodio
       if (seasonNumber != null && episodeNumber != null) {
-        url = 'https://vixsrc.to/tv/${widget.item.id}/$seasonNumber/$episodeNumber';
+        url = 'https://vixsrc.to/tv/$id/$seasonNumber/$episodeNumber';
       } else {
-        url = 'https://vixsrc.to/tv/${widget.item.id}';
+        // Usa sempre stagione 1, episodio 1 per le serie TV
+        url = 'https://vixsrc.to/tv/$id/1/1';
       }
     } else {
-      url = 'https://vixsrc.to/${widget.item.mediaType}/${widget.item.id}';
+      url = 'https://vixsrc.to/$mediaType/$id';
+    }
+
+    // Apri nella WebView integrata
+    if (context.mounted) {
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (context) => StreamingWebView(
+            url: url,
+            title: widget.item.title,
+            mediaType: mediaType,
+            id: id,
+            seasonNumber: seasonNumber,
+            episodeNumber: episodeNumber,
+          ),
+        ),
+      );
+    }
+  }
+  
+  // Apri nel browser esterno
+  Future<void> openInBrowser(BuildContext context, {int? seasonNumber, int? episodeNumber}) async {
+    String url;
+    String mediaType = widget.item.mediaType;
+    int id = widget.item.id;
+    
+    // Verifica se il contenuto è disponibile
+    bool isAvailable = await AvailabilityService.isContentAvailable(mediaType, id);
+    
+    if (!isAvailable) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Questo contenuto non è disponibile per lo streaming")),
+        );
+      }
+      return;
+    }
+    
+    if (mediaType == 'movie') {
+      url = 'https://vixsrc.to/movie/$id';
+    } else if (mediaType == 'tv') {
+      // Per le serie TV, se non sono specificate stagione ed episodio,
+      // imposta automaticamente alla prima stagione, primo episodio
+      if (seasonNumber != null && episodeNumber != null) {
+        url = 'https://vixsrc.to/tv/$id/$seasonNumber/$episodeNumber';
+      } else {
+        // Usa sempre stagione 1, episodio 1 per le serie TV
+        url = 'https://vixsrc.to/tv/$id/1/1';
+      }
+    } else {
+      url = 'https://vixsrc.to/$mediaType/$id';
     }
 
     final Uri uri = Uri.parse(url);
@@ -991,6 +1962,36 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
             ),
           ),
           
+          // Mostra la posizione salvata se disponibile
+          if (savedPosition != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).primaryColor.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Theme.of(context).primaryColor.withOpacity(0.5)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.play_circle_outline, color: Colors.white70),
+                    const SizedBox(width: 8),
+                    Text(
+                      'Riprendi da ${PlaybackPositionManager.formatTime(savedPosition!)}',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      icon: const Icon(Icons.play_arrow),
+                      tooltip: 'Riprendi',
+                      onPressed: () => openInWebView(context),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          
           // Trama
           if (widget.item.overview != null && widget.item.overview!.isNotEmpty)
             Padding(
@@ -1055,20 +2056,41 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
             ),
           ),
           
-          // Pulsante per vedere lo streaming
+          // Pulsanti per vedere lo streaming
           Padding(
             padding: const EdgeInsets.all(16.0),
-            child: SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                icon: const Icon(Icons.play_arrow),
-                label: const Text("Guarda ora"),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Theme.of(context).primaryColor,
-                  padding: const EdgeInsets.symmetric(vertical: 16),
+            child: Column(
+              children: [
+                // Pulsante principale per WebView
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text("Guarda in WebView"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Theme.of(context).primaryColor,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                    ),
+                    onPressed: () => openInWebView(context),
+                  ),
                 ),
-                onPressed: () => openStreamingLink(context),
-              ),
+                
+                const SizedBox(height: 8),
+                
+                // Pulsante per browser esterno
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.open_in_browser),
+                    label: const Text("Apri nel Browser"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.grey[700],
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                    ),
+                    onPressed: () => openInBrowser(context),
+                  ),
+                ),
+              ],
             ),
           ),
         ],
@@ -1193,7 +2215,30 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
                     )
                   : null,
               leading: const Icon(Icons.play_circle_outline),
-              onTap: () => openStreamingLink(
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.play_arrow),
+                    tooltip: 'Guarda in WebView',
+                    onPressed: () => openInWebView(
+                      context,
+                      seasonNumber: seasonNumber,
+                      episodeNumber: episode.episodeNumber,
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.open_in_browser),
+                    tooltip: 'Apri nel Browser',
+                    onPressed: () => openInBrowser(
+                      context,
+                      seasonNumber: seasonNumber,
+                      episodeNumber: episode.episodeNumber,
+                    ),
+                  ),
+                ],
+              ),
+              onTap: () => openInWebView(
                 context,
                 seasonNumber: seasonNumber,
                 episodeNumber: episode.episodeNumber,
@@ -1280,7 +2325,7 @@ class _StreamingHomePageState extends State<StreamingHomePage> {
         );
         
         setState(() {
-          result = "Film trovato! Clicca il link per aprirlo o copia il link:";
+          result = "Film trovato! Guarda in WebView o apri nel browser:";
           linkToOpen = url;
           foundItem = item;
           isLoading = false;
@@ -1320,7 +2365,7 @@ class _StreamingHomePageState extends State<StreamingHomePage> {
         );
         
         setState(() {
-          result = "Serie trovata! Clicca il link per aprirla o copia il link:";
+          result = "Serie trovata! Guarda in WebView o apri nel browser:";
           linkToOpen = url;
           foundItem = item;
           isLoading = false;
@@ -1339,7 +2384,8 @@ class _StreamingHomePageState extends State<StreamingHomePage> {
     }
   }
 
-  Future<void> openLink(String url) async {
+  // Apri nel browser esterno
+  Future<void> openInBrowser(String url) async {
     final Uri uri = Uri.parse(url);
     try {
       await launchUrl(
@@ -1351,6 +2397,24 @@ class _StreamingHomePageState extends State<StreamingHomePage> {
         SnackBar(content: Text("Non posso aprire il link: $url"))
       );
     }
+  }
+
+  // Apri in WebView
+  void openInWebView(String url) {
+    if (foundItem == null) return;
+    
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => StreamingWebView(
+          url: url,
+          title: foundItem!.title,
+          mediaType: foundItem!.mediaType,
+          id: foundItem!.id,
+          seasonNumber: choice == 'serie' ? int.tryParse(seasonController.text) : null,
+          episodeNumber: choice == 'serie' ? int.tryParse(episodeController.text) : null,
+        ),
+      ),
+    );
   }
 
   void copyLink(String url) {
@@ -1517,60 +2581,51 @@ class _StreamingHomePageState extends State<StreamingHomePage> {
                             ),
                           ),
                         ),
-                        IconButton(
-                          icon: const Icon(Icons.copy),
-                          tooltip: "Copia link",
-                          onPressed: () => copyLink(linkToOpen!),
+                        Theme(
+                          // Disabilita l'effetto splash
+                          data: ThemeData(
+                            splashColor: Colors.transparent,
+                            highlightColor: Colors.transparent,
+                          ),
+                          child: IconButton(
+                            icon: const Icon(Icons.copy, color:Colors.white),
+                            tooltip: "Copia link",
+                            onPressed: () => copyLink(linkToOpen!),
+                          ),
                         ),
                       ],
                     ),
                   ),
                 ),
                 const SizedBox(height: 16),
-                // Pulsanti per azioni
-                Row(
-                  children: [
-                    // Pulsante per aprire nel browser
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        icon: const Icon(Icons.open_in_browser),
-                        label: const Text("Apri nel Browser"),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Theme.of(context).primaryColor,
-                          padding: const EdgeInsets.symmetric(vertical: 16),
-                        ),
-                        onPressed: () => openLink(linkToOpen!),
-                      ),
+                // Pulsante per aprire in WebView (principale)
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text("Guarda in WebView"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Theme.of(context).primaryColor,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
                     ),
-                    const SizedBox(width: 16),
-                    // Pulsante per vedere nel catalogo
-                    Expanded(
-                      child: ElevatedButton.icon(
-                        icon: const Icon(Icons.library_books),
-                        label: const Text("Vedi nel Catalogo"),
-                        style: ElevatedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 16),
-                        ),
-                        onPressed: () {
-                          if (foundItem != null) {
-                            // Salva la ricerca attuale nel servizio
-                            SearchService.setSearch(
-                              titleController.text.trim(),
-                              choice == 'film' ? 'movie' : 'tv'
-                            );
-                            
-                            // Passa alla tab del catalogo
-                            final mainPageState = context.findAncestorStateOfType<_MainPageState>();
-                            if (mainPageState != null) {
-                              mainPageState._onItemTapped(1);
-                            }
-                          }
-                        },
-                      ),
-                    ),
-                  ],
+                    onPressed: () => openInWebView(linkToOpen!),
+                  ),
                 ),
-                // Aggiunta per visualizzare direttamente i dettagli
+                const SizedBox(height: 8),
+                // Pulsante per aprire nel browser
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.open_in_browser),
+                    label: const Text("Apri nel Browser"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.grey[700],
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                    ),
+                    onPressed: () => openInBrowser(linkToOpen!),
+                  ),
+                ),
+                // Pulsante per visualizzare i dettagli
                 if (foundItem != null) ...[
                   const SizedBox(height: 16),
                   ElevatedButton.icon(
@@ -1625,33 +2680,24 @@ class CatalogPage extends StatefulWidget {
 }
 
 class _CatalogPageState extends State<CatalogPage> {
-  static const String apiKey = "80157e25b43ede5bf3e4114fa3845d18";
+  final CatalogService _catalogService = CatalogService();
+  
+  // Cache degli episodi spostata a livello di classe
+  static final Map<int, int> _episodeCache = {};
   
   String selectedType = 'movie';
-  List<CatalogItem> catalogItems = [];
-  List<int> allTmdbIds = [];
-  bool isLoading = false;
-  bool isLoadingMore = false;
-  String error = '';
-  String rawResponse = '';
-  int loadedItemsCount = 0;
-  int totalItems = 0;
   String? searchQuery; // Per memorizzare la ricerca dalla home
   
   final ScrollController _scrollController = ScrollController();
-  final int _initialLoadCount = 20; // Numero di titoli da caricare all'inizio
-  final int _loadMoreCount = 10; // Numero di titoli da caricare quando si scorre
   final double _scrollThreshold = 200.0; // Soglia di scorrimento per caricare più titoli
-  
-  // Mappe per i generi di film e serie TV
-  Map<int, String> movieGenres = {};
-  Map<int, String> tvGenres = {};
   
   @override
   void initState() {
     super.initState();
     _scrollController.addListener(_onScroll);
-    _loadGenres();
+    
+    // Carica i generi all'inizio
+    _catalogService.loadGenres();
     
     // Verifica se c'è una ricerca pendente
     if (SearchService.pendingSearchQuery != null) {
@@ -1660,12 +2706,19 @@ class _CatalogPageState extends State<CatalogPage> {
       
       // Programma la ricerca dopo il primo render
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        searchInCatalog(searchQuery!);
+        _catalogService.searchInCatalog(searchQuery!, selectedType, setState);
         // Pulisci la ricerca pendente
         SearchService.clearSearch();
       });
     } else {
-      fetchCatalogIds();
+      _loadCatalogIfNeeded();
+    }
+  }
+  
+  void _loadCatalogIfNeeded() {
+    // Carica il catalogo solo se non è già stato inizializzato
+    if (!_catalogService.hasInitialized(selectedType)) {
+      _catalogService.fetchCatalogIds(selectedType, setState);
     }
   }
   
@@ -1679,7 +2732,7 @@ class _CatalogPageState extends State<CatalogPage> {
   void _onScroll() {
     if (_scrollController.position.pixels > 
         _scrollController.position.maxScrollExtent - _scrollThreshold) {
-      _loadMoreTitles();
+      _catalogService.loadMoreTitles(selectedType, setState);
     }
   }
   
@@ -1690,319 +2743,9 @@ class _CatalogPageState extends State<CatalogPage> {
       selectedType = type;
     });
     // Effettua la ricerca
-    searchInCatalog(query);
+    _catalogService.searchInCatalog(query, selectedType, setState);
   }
   
-  // Cerca un titolo nel catalogo
-  Future<void> searchInCatalog(String query) async {
-    if (mounted) {
-      setState(() {
-        isLoading = true;
-        error = '';
-        catalogItems = [];
-      });
-    }
-    
-    try {
-      final searchType = selectedType == 'movie' ? 'movie' : 'tv';
-      final url = 'https://api.themoviedb.org/3/search/$searchType?api_key=$apiKey&query=$query&language=it';
-      final response = await http.get(Uri.parse(url));
-      
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        if (data['results'] != null && data['results'].isNotEmpty) {
-          List<CatalogItem> searchResults = [];
-          List<Map<int, String>> genreMaps = [movieGenres, tvGenres];
-          
-          for (var item in data['results']) {
-            searchResults.add(CatalogItem.fromTmdbJson(item, selectedType, genreMaps));
-          }
-          
-          if (mounted) {
-            setState(() {
-              catalogItems = searchResults;
-              isLoading = false;
-            });
-          }
-        } else {
-          if (mounted) {
-            setState(() {
-              error = 'Nessun risultato trovato per "$query"';
-              isLoading = false;
-            });
-          }
-        }
-      } else {
-        if (mounted) {
-          setState(() {
-            error = 'Errore nella ricerca: ${response.statusCode}';
-            isLoading = false;
-          });
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          error = 'Errore: $e';
-          isLoading = false;
-        });
-      }
-    }
-  }
-  
-  // Carica più titoli quando si scorre in fondo
-  void _loadMoreTitles() {
-    if (!isLoadingMore && loadedItemsCount < allTmdbIds.length) {
-      if (mounted) {
-        setState(() {
-          isLoadingMore = true;
-        });
-      }
-      
-      // Calcola gli indici per il prossimo batch di ID da caricare
-      final end = (loadedItemsCount + _loadMoreCount <= allTmdbIds.length) 
-          ? loadedItemsCount + _loadMoreCount 
-          : allTmdbIds.length;
-      
-      // Ottieni il prossimo batch di ID
-      final nextBatch = allTmdbIds.sublist(loadedItemsCount, end);
-      
-      // Aggiungi immediatamente item di "caricamento" alla lista
-      final startIndex = catalogItems.length;
-      if (mounted) {
-        setState(() {
-          for (final id in nextBatch) {
-            catalogItems.add(CatalogItem(
-              id: id,
-              title: 'Caricamento...',
-              mediaType: selectedType,
-            ));
-          }
-        });
-      }
-      
-      // Carica i dettagli per questi ID
-      _fetchTitlesForIds(nextBatch, startIndex).then((_) {
-        if (mounted) {
-          setState(() {
-            isLoadingMore = false;
-            loadedItemsCount = end;
-          });
-        }
-      });
-    }
-  }
-  
-  // Carica le liste di generi da TMDB
-  Future<void> _loadGenres() async {
-    try {
-      // Carica generi film
-      final movieGenresUrl = 'https://api.themoviedb.org/3/genre/movie/list?api_key=$apiKey&language=it';
-      final movieGenresResponse = await http.get(Uri.parse(movieGenresUrl));
-      if (movieGenresResponse.statusCode == 200) {
-        final data = json.decode(movieGenresResponse.body);
-        if (data['genres'] != null) {
-          for (var genre in data['genres']) {
-            movieGenres[genre['id']] = genre['name'];
-          }
-        }
-      }
-      
-      // Carica generi serie TV
-      final tvGenresUrl = 'https://api.themoviedb.org/3/genre/tv/list?api_key=$apiKey&language=it';
-      final tvGenresResponse = await http.get(Uri.parse(tvGenresUrl));
-      if (tvGenresResponse.statusCode == 200) {
-        final data = json.decode(tvGenresResponse.body);
-        if (data['genres'] != null) {
-          for (var genre in data['genres']) {
-            tvGenres[genre['id']] = genre['name'];
-          }
-        }
-      }
-    } catch (e) {
-      // Ignora errori nel caricamento dei generi
-    }
-  }
-
-  // Carica tutti gli ID TMDB inizialmente
-  Future<void> fetchCatalogIds() async {
-    // Se c'è una query di ricerca, esegui una ricerca invece
-    if (searchQuery != null && searchQuery!.isNotEmpty) {
-      return searchInCatalog(searchQuery!);
-    }
-    
-    if (mounted) {
-      setState(() {
-        isLoading = true;
-        error = '';
-        catalogItems = [];
-        allTmdbIds = [];
-        rawResponse = '';
-        loadedItemsCount = 0;
-        totalItems = 0;
-      });
-    }
-
-    try {
-      // Ottiene la lista degli ID TMDB
-      final url = 'https://vixsrc.to/api/list/$selectedType?lang=it';
-      final response = await http.get(Uri.parse(url));
-      
-      if (mounted) {
-        setState(() {
-          rawResponse = 'URL: $url\n\nStatus: ${response.statusCode}\n\nResponse body:\n${response.body}';
-        });
-      }
-      
-      if (response.statusCode == 200) {
-        dynamic data;
-        try {
-          data = json.decode(response.body);
-        } catch (e) {
-          if (mounted) {
-            setState(() {
-              error = 'Errore nel formato della risposta: $e';
-              isLoading = false;
-            });
-          }
-          return;
-        }
-        
-        List<int> tmdbIds = [];
-        
-        if (data is List) {
-          for (var item in data) {
-            if (item is Map && item.containsKey('tmdb_id')) {
-              final tmdbId = item['tmdb_id'];
-              if (tmdbId != null) {
-                try {
-                  final id = tmdbId is int ? tmdbId : int.parse(tmdbId.toString());
-                  tmdbIds.add(id);
-                } catch (e) {
-                  // Skip invalid IDs
-                }
-              }
-            }
-          }
-        }
-        
-        if (tmdbIds.isEmpty) {
-          if (mounted) {
-            setState(() {
-              error = 'Nessun ID TMDB valido trovato nella risposta';
-              isLoading = false;
-            });
-          }
-          return;
-        }
-        
-        // Salva tutti gli ID per il caricamento progressivo
-        if (mounted) {
-          setState(() {
-            allTmdbIds = tmdbIds;
-            totalItems = tmdbIds.length;
-          });
-        }
-        
-        // Carica solo i primi _initialLoadCount titoli inizialmente
-        final initialBatchSize = tmdbIds.length < _initialLoadCount ? tmdbIds.length : _initialLoadCount;
-        final initialBatch = tmdbIds.sublist(0, initialBatchSize);
-        
-        // Crea placeholder per i primi elementi
-        List<CatalogItem> initialPlaceholders = initialBatch.map((id) => CatalogItem(
-          id: id,
-          title: 'Caricamento...',
-          mediaType: selectedType,
-        )).toList();
-        
-        if (mounted) {
-          setState(() {
-            catalogItems = initialPlaceholders;
-          });
-        }
-        
-        // Carica i dettagli per il batch iniziale
-        await _fetchTitlesForIds(initialBatch, 0);
-        
-        if (mounted) {
-          setState(() {
-            isLoading = false;
-            loadedItemsCount = initialBatchSize;
-          });
-        }
-        
-      } else {
-        if (mounted) {
-          setState(() {
-            error = 'Errore ${response.statusCode}: ${response.reasonPhrase}';
-            isLoading = false;
-          });
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          error = 'Errore di connessione: $e';
-          isLoading = false;
-        });
-      }
-    }
-  }
-
-  // Carica i titoli per un insieme specifico di ID
-  Future<void> _fetchTitlesForIds(List<int> ids, int startIndex) async {
-    final tmdbType = selectedType == 'tv' ? 'tv' : 'movie';
-    
-    // Limita richieste simultanee
-    final maxConcurrentRequests = 5;
-    
-    for (int i = 0; i < ids.length; i += maxConcurrentRequests) {
-      final end = (i + maxConcurrentRequests < ids.length) ? i + maxConcurrentRequests : ids.length;
-      final chunk = ids.sublist(i, end);
-      
-      // Richieste parallele per questo blocco
-      final results = await Future.wait(
-        chunk.map((id) async {
-          try {
-            final tmdbUrl = 'https://api.themoviedb.org/3/$tmdbType/$id?api_key=$apiKey&language=it';
-            final tmdbResponse = await http.get(Uri.parse(tmdbUrl));
-            
-            if (tmdbResponse.statusCode == 200) {
-              final tmdbData = json.decode(tmdbResponse.body);
-              
-              // Lista dei generi da passare al costruttore
-              List<Map<int, String>> genreMaps = [movieGenres, tvGenres];
-              
-              final item = CatalogItem.fromTmdbJson(tmdbData, tmdbType, genreMaps);
-              return item;
-            }
-          } catch (e) {
-            // Ignora errori individuali
-          }
-          
-          // Se non riusciamo a ottenere i dettagli, usa un item con dati minimi
-          return CatalogItem(
-            id: id,
-            title: 'ID: $id',
-            mediaType: tmdbType,
-          );
-        }),
-      );
-      
-      // Aggiorna gli elementi corrispondenti nella lista
-      if (mounted) {
-        setState(() {
-          for (int j = 0; j < results.length; j++) {
-            final itemIndex = startIndex + i + j;
-            if (itemIndex < catalogItems.length) {
-              catalogItems[itemIndex] = results[j];
-            }
-          }
-        });
-      }
-    }
-  }
-
   // Funzione per vedere la risposta grezza dell'API
   void _viewRawApiResponse() {
     showDialog(
@@ -2018,7 +2761,9 @@ class _CatalogPageState extends State<CatalogPage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  rawResponse.isEmpty ? 'Nessuna risposta disponibile' : rawResponse,
+                  _catalogService.getRawResponse(selectedType).isEmpty 
+                    ? 'Nessuna risposta disponibile' 
+                    : _catalogService.getRawResponse(selectedType),
                   style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
                 ),
               ],
@@ -2030,10 +2775,10 @@ class _CatalogPageState extends State<CatalogPage> {
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('Chiudi'),
           ),
-          if (rawResponse.isNotEmpty)
+          if (_catalogService.getRawResponse(selectedType).isNotEmpty)
             TextButton(
               onPressed: () {
-                Clipboard.setData(ClipboardData(text: rawResponse));
+                Clipboard.setData(ClipboardData(text: _catalogService.getRawResponse(selectedType)));
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(content: Text('Risposta API copiata negli appunti')),
                 );
@@ -2054,7 +2799,7 @@ class _CatalogPageState extends State<CatalogPage> {
         transitionDuration: const Duration(milliseconds: 300),
         pageBuilder: (context, animation, secondaryAnimation) => DetailPage(item: item),
         transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          // Modifica: animazione dal basso invece che da destra
+          // Animazione dal basso invece che da destra
           var begin = const Offset(0.0, 1.0);
           var end = Offset.zero;
           var curve = Curves.easeInOut;
@@ -2072,14 +2817,100 @@ class _CatalogPageState extends State<CatalogPage> {
     );
   }
 
+  // Apri direttamente in WebView
+  void openInWebView(BuildContext context, CatalogItem item) {
+    String url;
+    if (item.mediaType == 'movie') {
+      url = 'https://vixsrc.to/movie/${item.id}';
+    } else {
+      // Per le serie TV, usa sempre stagione 1, episodio 1
+      url = 'https://vixsrc.to/tv/${item.id}/1/1';
+    }
+    
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => StreamingWebView(
+          url: url,
+          title: item.title,
+          mediaType: item.mediaType,
+          id: item.id,
+          seasonNumber: item.mediaType == 'tv' ? 1 : null,
+          episodeNumber: item.mediaType == 'tv' ? 1 : null,
+        ),
+      ),
+    );
+  }
+
+  // Metodo per ottenere il numero totale di episodi di una serie
+  Future<int> _getEpisodeCount(int tvId) async {
+    // Usa un sistema di cache per evitare richieste ripetute
+    if (_episodeCache.containsKey(tvId)) {
+      return _episodeCache[tvId]!;
+    }
+
+    try {
+      final url = 'https://api.themoviedb.org/3/tv/$tvId?api_key=${CatalogService.apiKey}&language=it';
+      final response = await http.get(Uri.parse(url));
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        int totalEpisodes = 0;
+        
+        if (data['seasons'] != null) {
+          for (var season in data['seasons']) {
+            totalEpisodes += season['episode_count'] as int? ?? 0;
+          }
+        }
+        
+        // Memorizza nella cache
+        _episodeCache[tvId] = totalEpisodes;
+        return totalEpisodes;
+      }
+    } catch (e) {
+      print('Errore nel recupero degli episodi: $e');
+    }
+    
+    return 0;
+  }
+
+  // Metodo per formattare la durata in ore e minuti
+  String _formatRuntime(int minutes) {
+    final hours = minutes ~/ 60;
+    final remainingMinutes = minutes % 60;
+    if (hours > 0) {
+      return '$hours h ${remainingMinutes > 0 ? '$remainingMinutes min' : ''}';
+    } else {
+      return '$minutes min';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final items = _catalogService.getItems(selectedType);
+    final isLoading = _catalogService.isLoading(selectedType);
+    final error = _catalogService.getError(selectedType);
+    final loadedItemsCount = _catalogService.getLoadedItemsCount(selectedType);
+    final allTmdbIds = _catalogService.getTmdbIds(selectedType);
+    
     return Scaffold(
       appBar: AppBar(
         title: searchQuery != null 
             ? Text('Risultati per "$searchQuery"') 
             : const Text('Catalogo'),
         actions: [
+          // Pulsante per tornare alla visualizzazione principale se siamo in modalità ricerca
+          if (searchQuery != null)
+            IconButton(
+              icon: const Icon(Icons.home),
+              tooltip: 'Torna al catalogo',
+              onPressed: () {
+                setState(() {
+                  searchQuery = null;
+                  _catalogService.setSearchQuery(selectedType, '');
+                });
+                _catalogService.fetchCatalogIds(selectedType, setState);
+              },
+            ),
           // Pulsante per vedere la risposta API grezza
           IconButton(
             icon: const Icon(Icons.code),
@@ -2094,15 +2925,16 @@ class _CatalogPageState extends State<CatalogPage> {
               // Cancella la query di ricerca quando si ricarica
               setState(() {
                 searchQuery = null;
+                _catalogService.setSearchQuery(selectedType, '');
               });
-              fetchCatalogIds();
+              _catalogService.fetchCatalogIds(selectedType, setState);
             },
           ),
         ],
       ),
       body: Column(
         children: [
-          // Pulsanti per selezionare film o serie TV (come nella pagina di ricerca)
+          // Pulsanti per selezionare film o serie TV
           Padding(
             padding: const EdgeInsets.all(16.0),
             child: Row(
@@ -2119,8 +2951,9 @@ class _CatalogPageState extends State<CatalogPage> {
                         setState(() {
                           selectedType = 'movie';
                           searchQuery = null; // Resetta la ricerca
+                          _catalogService.setSearchQuery('movie', '');
                         });
-                        fetchCatalogIds();
+                        _loadCatalogIfNeeded();
                       }
                     },
                     child: const Text("Film"),
@@ -2139,8 +2972,9 @@ class _CatalogPageState extends State<CatalogPage> {
                         setState(() {
                           selectedType = 'tv';
                           searchQuery = null; // Resetta la ricerca
+                          _catalogService.setSearchQuery('tv', '');
                         });
-                        fetchCatalogIds();
+                        _loadCatalogIfNeeded();
                       }
                     },
                     child: const Text("Serie"),
@@ -2152,7 +2986,7 @@ class _CatalogPageState extends State<CatalogPage> {
 
           // Contenuto principale
           Expanded(
-            child: isLoading && catalogItems.isEmpty
+            child: isLoading && items.isEmpty
                 ? const Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
@@ -2163,7 +2997,7 @@ class _CatalogPageState extends State<CatalogPage> {
                       ],
                     ),
                   )
-                : error.isNotEmpty && catalogItems.isEmpty
+                : error.isNotEmpty && items.isEmpty
                     ? Center(
                         child: Padding(
                           padding: const EdgeInsets.all(16.0),
@@ -2183,7 +3017,7 @@ class _CatalogPageState extends State<CatalogPage> {
                                     style: ElevatedButton.styleFrom(
                                       backgroundColor: Theme.of(context).primaryColor,
                                     ),
-                                    onPressed: fetchCatalogIds,
+                                    onPressed: () => _catalogService.fetchCatalogIds(selectedType, setState),
                                     child: const Text("Riprova"),
                                   ),
                                   const SizedBox(width: 16),
@@ -2197,7 +3031,7 @@ class _CatalogPageState extends State<CatalogPage> {
                           ),
                         ),
                       )
-                    : catalogItems.isEmpty
+                    : items.isEmpty
                         ? const Center(
                             child: Text('Nessun contenuto trovato'),
                           )
@@ -2205,15 +3039,15 @@ class _CatalogPageState extends State<CatalogPage> {
                             children: [
                               // Lista principale con RefreshIndicator
                               RefreshIndicator(
-                                onRefresh: fetchCatalogIds,
+                                onRefresh: () => _catalogService.fetchCatalogIds(selectedType, setState),
                                 color: Theme.of(context).primaryColor,
                                 child: ListView.builder(
                                   controller: _scrollController,
                                   padding: const EdgeInsets.all(8),
-                                  itemCount: catalogItems.length + (loadedItemsCount < allTmdbIds.length ? 1 : 0),
+                                  itemCount: items.length + (loadedItemsCount < allTmdbIds.length ? 1 : 0),
                                   itemBuilder: (context, index) {
-                                    // Se siamo all'ultimo elemento e ci sono ancora ID da caricare, mostra un indicatore
-                                    if (index == catalogItems.length) {
+                                    // Se siamo all'ultimo elemento e ci sono ancora ID da caricare
+                                    if (index == items.length) {
                                       return Container(
                                         padding: const EdgeInsets.symmetric(vertical: 16),
                                         alignment: Alignment.center,
@@ -2223,9 +3057,8 @@ class _CatalogPageState extends State<CatalogPage> {
                                       );
                                     }
                                     
-                                    final item = catalogItems[index];
+                                    final item = items[index];
                                     return Card(
-                                      // Applica lo stile della card qui invece di usare cardTheme
                                       shape: RoundedRectangleBorder(
                                         borderRadius: BorderRadius.circular(12),
                                       ),
@@ -2234,56 +3067,123 @@ class _CatalogPageState extends State<CatalogPage> {
                                       margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
                                       child: InkWell(
                                         onTap: () => openDetailPage(context, item),
-                                        child: ListTile(
-                                          contentPadding: const EdgeInsets.all(12),
-                                          leading: Hero(
-                                            tag: 'poster_${item.id}_${item.mediaType}',
-                                            child: ClipRRect(
-                                              borderRadius: BorderRadius.circular(8),
-                                              child: item.posterPath != null
-                                                  ? Image.network(
-                                                      'https://image.tmdb.org/t/p/w92${item.posterPath}',
-                                                      width: 50,
-                                                      errorBuilder: (context, error, stackTrace) =>
-                                                          const Icon(Icons.movie, size: 50),
-                                                    )
-                                                  : const Icon(Icons.movie, size: 50),
-                                            ),
-                                          ),
-                                          title: Hero(
-                                            tag: 'title_${item.id}_${item.mediaType}',
-                                            child: Material(
-                                              color: Colors.transparent,
-                                              child: Text(
-                                                item.title,
-                                                style: const TextStyle(fontWeight: FontWeight.bold),
+                                        child: Stack(
+                                          children: [
+                                            ListTile(
+                                              contentPadding: const EdgeInsets.all(12),
+                                              leading: Hero(
+                                                tag: 'poster_${item.id}_${item.mediaType}',
+                                                child: ClipRRect(
+                                                  borderRadius: BorderRadius.circular(8),
+                                                  child: item.posterPath != null
+                                                      ? Image.network(
+                                                          'https://image.tmdb.org/t/p/w92${item.posterPath}',
+                                                          width: 50,
+                                                          errorBuilder: (context, error, stackTrace) =>
+                                                              const Icon(Icons.movie, size: 50),
+                                                        )
+                                                      : const Icon(Icons.movie, size: 50),
+                                                ),
+                                              ),
+                                              title: Hero(
+                                                tag: 'title_${item.id}_${item.mediaType}',
+                                                child: Material(
+                                                  color: Colors.transparent,
+                                                  child: Text(
+                                                    item.title,
+                                                    style: const TextStyle(fontWeight: FontWeight.bold),
+                                                  ),
+                                                ),
+                                              ),
+                                              subtitle: Column(
+                                                crossAxisAlignment: CrossAxisAlignment.start,
+                                                children: [
+                                                  // Invece di mostrare l'ID, mostra la durata per i film o gli episodi per le serie
+                                                  if (item.mediaType == 'movie')
+                                                    item.runtime != null 
+                                                      ? Row(
+                                                          children: [
+                                                            const Icon(Icons.access_time, size: 14, color: Colors.grey),
+                                                            const SizedBox(width: 4),
+                                                            Text(_formatRuntime(item.runtime!)),
+                                                          ],
+                                                        )
+                                                      : const Text("Durata non disponibile"),
+                                                  if (item.mediaType == 'tv')
+                                                    Row(
+                                                      children: [
+                                                        const Icon(Icons.list, size: 14, color: Colors.grey),
+                                                        const SizedBox(width: 4),
+                                                        FutureBuilder<int>(
+                                                          future: _getEpisodeCount(item.id),
+                                                          builder: (context, snapshot) {
+                                                            if (snapshot.connectionState == ConnectionState.waiting) {
+                                                              return const Text("Caricamento episodi...");
+                                                            }
+                                                            if (snapshot.hasData && snapshot.data! > 0) {
+                                                              return Text("${snapshot.data} episodi");
+                                                            }
+                                                            return const Text("Episodi non disponibili");
+                                                          },
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  if (item.releaseDate != null && item.releaseDate!.isNotEmpty)
+                                                    Text(
+                                                      "Anno: ${item.releaseDate!.length >= 4 
+                                                          ? item.releaseDate!.substring(0, 4) 
+                                                          : item.releaseDate!}"
+                                                    ),
+                                                ],
+                                              ),
+                                              trailing: Container(
+                                                width: 40,
+                                                height: 40,
+                                                decoration: BoxDecoration(
+                                                  color: Theme.of(context).primaryColor.withOpacity(0.2),
+                                                  borderRadius: BorderRadius.circular(20),
+                                                ),
+                                                child: IconButton(
+                                                  icon: const Icon(Icons.play_arrow, size: 22, color: Colors.white),
+                                                  padding: EdgeInsets.zero,
+                                                  onPressed: () => openInWebView(context, item),
+                                                  tooltip: 'Guarda in WebView',
+                                                ),
                                               ),
                                             ),
-                                          ),
-                                          subtitle: Column(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
-                                            children: [
-                                              Text("ID: ${item.id}"),
-                                              if (item.releaseDate != null && item.releaseDate!.isNotEmpty)
-                                                Text(
-                                                  "Anno: ${item.releaseDate!.length >= 4 
-                                                      ? item.releaseDate!.substring(0, 4) 
-                                                      : item.releaseDate!}"
-                                                ),
-                                            ],
-                                          ),
-                                          trailing: Container(
-                                            width: 40,
-                                            height: 40,
-                                            decoration: BoxDecoration(
-                                              color: Theme.of(context).primaryColor.withOpacity(0.2),
-                                              borderRadius: BorderRadius.circular(20),
+                                            // Posiziona un chip per il tempo salvato, se presente
+                                            FutureBuilder<double?>(
+                                              future: PlaybackPositionManager.getPosition(
+                                                item.mediaType, 
+                                                item.id, 
+                                                null, 
+                                                null
+                                              ),
+                                              builder: (context, snapshot) {
+                                                if (snapshot.hasData && snapshot.data != null && snapshot.data! > 0) {
+                                                  return Positioned(
+                                                    bottom: 8,
+                                                    right: 60,
+                                                    child: Container(
+                                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                                      decoration: BoxDecoration(
+                                                        color: Theme.of(context).primaryColor,
+                                                        borderRadius: BorderRadius.circular(4),
+                                                      ),
+                                                      child: Text(
+                                                        PlaybackPositionManager.formatTime(snapshot.data!),
+                                                        style: const TextStyle(
+                                                          fontSize: 10,
+                                                          fontWeight: FontWeight.bold,
+                                                        ),
+                                                      ),
+                                                    ),
+                                                  );
+                                                }
+                                                return const SizedBox.shrink();
+                                              },
                                             ),
-                                            child: const Icon(
-                                              Icons.info_outline,
-                                              color: Colors.white,
-                                            ),
-                                          ),
+                                          ],
                                         ),
                                       ),
                                     );
@@ -2292,7 +3192,7 @@ class _CatalogPageState extends State<CatalogPage> {
                               ),
                               
                               // Indicatore durante il caricamento
-                              if (isLoading && !catalogItems.isEmpty)
+                              if (isLoading && items.isNotEmpty)
                                 Positioned(
                                   bottom: 16,
                                   left: 0,
