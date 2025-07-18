@@ -3,6 +3,7 @@ import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter/services.dart';
 import 'dart:convert';
+import 'dart:async'; // Aggiunto per il Timer
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
@@ -151,6 +152,49 @@ class PlaybackPositionManager {
     final secs = (seconds.toInt() % 60).toString().padLeft(2, '0');
     return '$mins:$secs';
   }
+  
+  // Ottieni l'ultimo episodio guardato per una serie TV
+  static Future<Map<String, dynamic>?> getLastWatchedEpisode(String mediaType, int id) async {
+    if (mediaType != 'tv') return null;
+    
+    await initialize();
+    
+    // Cerca tutte le chiavi che corrispondono a questa serie
+    final seriesPrefix = '$mediaType:$id:s';
+    Map<String, dynamic>? lastEpisode;
+    double maxPosition = 0;
+    
+    for (var entry in _positions.entries) {
+      if (entry.key.startsWith(seriesPrefix)) {
+        // Estrai la stagione e l'episodio dalla chiave
+        final parts = entry.key.split(':');
+        if (parts.length >= 4) {
+          final seasonStr = parts[2].substring(1); // Rimuovi la 's' iniziale
+          final episodeStr = parts[3].substring(1); // Rimuovi la 'e' iniziale
+          
+          try {
+            final seasonNumber = int.parse(seasonStr);
+            final episodeNumber = int.parse(episodeStr);
+            final position = entry.value;
+            
+            // Controlla se questo è l'episodio guardato più recentemente
+            if (position > maxPosition) {
+              maxPosition = position;
+              lastEpisode = {
+                'seasonNumber': seasonNumber,
+                'episodeNumber': episodeNumber,
+                'position': position,
+              };
+            }
+          } catch (e) {
+            // Ignora chiavi con formato non valido
+          }
+        }
+      }
+    }
+    
+    return lastEpisode;
+  }
 }
 
 // Classe per la visualizzazione dei contenuti in WebView
@@ -183,11 +227,20 @@ class _StreamingWebViewState extends State<StreamingWebView> {
   String errorMessage = '';
   double? playbackPosition;
   bool hasInjectedJs = false;
+  Timer? _autoSaveTimer; // Timer per il salvataggio automatico
+  bool _isFullScreen = false; // Traccia lo stato della modalità a schermo intero
   
   @override
   void initState() {
     super.initState();
     _loadSavedPosition();
+    
+    // Configura il timer per salvare automaticamente ogni 30 secondi
+    _autoSaveTimer = Timer.periodic(const Duration(seconds: 30), (timer) {
+      if (playbackPosition != null && playbackPosition! > 0) {
+        _savePlaybackPosition(showNotification: false);
+      }
+    });
     
     _controller = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
@@ -205,6 +258,8 @@ class _StreamingWebViewState extends State<StreamingWebView> {
             });
             if (!hasInjectedJs) {
               _injectPlaybackTracker();
+              _injectAdBlocker(); // Aggiungiamo il blocco pubblicità
+              _injectFullscreenDetector(); // Aggiungiamo il rilevatore fullscreen
               hasInjectedJs = true;
             }
           },
@@ -217,10 +272,30 @@ class _StreamingWebViewState extends State<StreamingWebView> {
             print("WebView error: ${error.description}");
           },
           onNavigationRequest: (NavigationRequest request) {
+            // Blocca reindirizzamenti a domini pubblicitari noti
+            if (_isAdUrl(request.url)) {
+              print("Bloccato URL pubblicitario: ${request.url}");
+              return NavigationDecision.prevent;
+            }
+            
             // Consenti solo i link che iniziano con l'URL di base
             if (request.url.startsWith('https://vixsrc.to/')) {
               return NavigationDecision.navigate;
             }
+            
+            // Blocca tutti gli altri reindirizzamenti senza mostrare dialogo
+            print("Bloccato reindirizzamento a: ${request.url}");
+            
+            // Mostra un messaggio breve che scompare automaticamente
+            if (context.mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text("Reindirizzamento bloccato"),
+                  duration: const Duration(seconds: 1),
+                ),
+              );
+            }
+            
             return NavigationDecision.prevent;
           },
         ),
@@ -238,7 +313,276 @@ class _StreamingWebViewState extends State<StreamingWebView> {
           }
         },
       )
+      // Nuovo canale JavaScript per rilevare i cambiamenti del fullscreen
+      ..addJavaScriptChannel(
+        'FullscreenChannel',
+        onMessageReceived: (JavaScriptMessage message) {
+          if (message.message == 'enter') {
+            _enterFullScreen();
+          } else if (message.message == 'exit') {
+            _exitFullScreen();
+          }
+        },
+      )
       ..loadRequest(Uri.parse(widget.url));
+  }
+  
+  @override
+  void dispose() {
+    // Assicurati di uscire dalla modalità fullscreen quando si chiude la pagina
+    if (_isFullScreen) {
+      _exitFullScreen();
+    }
+    
+    // Cancella il timer quando la pagina viene chiusa
+    _autoSaveTimer?.cancel();
+    // Salva la posizione finale quando l'utente esce
+    _savePlaybackPosition(showNotification: false);
+    super.dispose();
+  }
+  
+  // Metodo per entrare in modalità fullscreen
+  void _enterFullScreen() {
+    if (!_isFullScreen) {
+      setState(() {
+        _isFullScreen = true;
+      });
+      // Nascondi tutti gli elementi dell'interfaccia di sistema
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+  }
+  
+  // Metodo per uscire dalla modalità fullscreen
+  void _exitFullScreen() {
+    if (_isFullScreen) {
+      setState(() {
+        _isFullScreen = false;
+      });
+      // Ripristina l'interfaccia di sistema normale
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+  }
+  
+  // Aggiungi questo metodo per rilevare quando il contenuto web entra/esce dal fullscreen
+  void _injectFullscreenDetector() {
+    _controller.runJavaScript('''
+      (function() {
+        // Lista di possibili eventi di cambio fullscreen in diversi browser
+        const fullscreenEvents = [
+          'fullscreenchange',
+          'webkitfullscreenchange',
+          'mozfullscreenchange',
+          'MSFullscreenChange'
+        ];
+        
+        // Funzione per controllare se siamo in fullscreen
+        function checkFullscreen() {
+          const isFullscreen = !!(
+            document.fullscreenElement ||
+            document.webkitFullscreenElement ||
+            document.mozFullScreenElement ||
+            document.msFullscreenElement
+          );
+          
+          // Comunica lo stato fullscreen all'app Flutter
+          if (isFullscreen) {
+            FullscreenChannel.postMessage('enter');
+          } else {
+            FullscreenChannel.postMessage('exit');
+          }
+        }
+        
+        // Aggiungi event listener per tutti i possibili eventi di fullscreen
+        fullscreenEvents.forEach(eventName => {
+          document.addEventListener(eventName, checkFullscreen);
+        });
+        
+        // Monitora anche i video che potrebbero entrare in modalità fullscreen
+        function monitorVideoFullscreen() {
+          const videos = document.querySelectorAll('video');
+          videos.forEach(video => {
+            // Aggiungi eventi di controllo alle proprietà fullscreen
+            if (!video._hasFullscreenListeners) {
+              video._hasFullscreenListeners = true;
+              
+              // Eventi specifici per iOS
+              video.addEventListener('webkitbeginfullscreen', function() {
+                console.log('Video entered fullscreen');
+                FullscreenChannel.postMessage('enter');
+              });
+              
+              video.addEventListener('webkitendfullscreen', function() {
+                console.log('Video exited fullscreen');
+                FullscreenChannel.postMessage('exit');
+              });
+              
+              // Eventi Picture-in-Picture
+              video.addEventListener('enterpictureinpicture', function() {
+                console.log('Entered PiP mode');
+                FullscreenChannel.postMessage('enter');
+              });
+              
+              video.addEventListener('leavepictureinpicture', function() {
+                console.log('Left PiP mode');
+                FullscreenChannel.postMessage('exit');
+              });
+            }
+          });
+        }
+        
+        // Esegui subito e controlla periodicamente per nuovi video
+        monitorVideoFullscreen();
+        setInterval(monitorVideoFullscreen, 1000);
+        
+        // Inoltre, osserva le mutazioni del DOM per rilevare nuovi video
+        const observer = new MutationObserver(function(mutations) {
+          monitorVideoFullscreen();
+        });
+        
+        // Avvia l'osservazione
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true
+        });
+      })();
+    ''');
+  }
+  
+  // Verifica se un URL è pubblicitario
+  bool _isAdUrl(String url) {
+    // Lista di domini pubblicitari comuni da bloccare
+    final List<String> adDomains = [
+      'ads.', 'ad.', 'adserver.', 'adclick.',
+      'doubleclick.net', 'googleadservices.com', 'googlesyndication.com',
+      'amazon-adsystem.com', 'adnxs.com', 'taboola.com',
+      'outbrain.com', 'clicksor.com', 'clksite.com',
+      'popads.net', 'popcash.net', 'propellerads.com',
+      'exoclick.com', 'juicyads.com', 'clickadu.com',
+      'advertserve.', 'cdn.adsafeprotected.com', 'banner.',
+      'track.', 'counter.', 'pixel.', 'stat.',
+      'affiliate.', 'promo.', 'redirect.'
+    ];
+    
+    // Controlla se l'URL contiene domini pubblicitari
+    for (var domain in adDomains) {
+      if (url.contains(domain)) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
+  
+  // Inietta JavaScript per bloccare pubblicità
+  void _injectAdBlocker() {
+    _controller.runJavaScript('''
+      (function() {
+        // Funzione per rimuovere annunci
+        function blockAds() {
+          // Selettori comuni per elementi pubblicitari
+          const adSelectors = [
+            'div[id*="google_ads_"]',
+            'div[id*="ad-"]',
+            'div[id*="ad_"]',
+            'div[class*="ad-"]',
+            'div[class*="ad_"]',
+            'div[class*="ads-"]',
+            'div[class*="ads_"]',
+            'iframe[src*="ads"]',
+            'iframe[src*="doubleclick"]',
+            'iframe[src*="googleads"]',
+            'iframe[src*="ad."]',
+            'a[href*="adclick"]',
+            'a[href*="doubleclick"]',
+            'a[href*="googleadservices"]',
+            'a[target="_blank"]',
+            'ins.adsbygoogle',
+            '.adsbygoogle',
+            '.ad-container',
+            '.ad-wrapper',
+            '#ad-wrapper',
+            '#ad-container',
+            '.popupOverlay',
+            '.popup-overlay',
+            '.modal-backdrop',
+            '.adBox',
+            '.ad-box',
+            'div[style*="z-index: 9999"]',
+            'div[style*="position: fixed"][style*="width: 100%"][style*="height: 100%"]'
+          ];
+          
+          // Rimuovi gli elementi corrispondenti
+          adSelectors.forEach(selector => {
+            const elements = document.querySelectorAll(selector);
+            elements.forEach(el => {
+              el.style.display = 'none';
+              el.remove();
+            });
+          });
+          
+          // Pulisci i popup che appaiono sopra il contenuto
+          const bodyElements = document.querySelectorAll('body > div:not([class]):not([id])');
+          bodyElements.forEach(el => {
+            const style = window.getComputedStyle(el);
+            if (style.position === 'fixed' && style.zIndex > 100) {
+              el.style.display = 'none';
+              el.remove();
+            }
+          });
+          
+          // Blocca anche gli overlay modali
+          const overlays = document.querySelectorAll('div[style*="position: fixed"]');
+          overlays.forEach(el => {
+            const style = window.getComputedStyle(el);
+            if (style.zIndex > 1000 && (style.width === '100%' || style.width === '100vw') && 
+                (style.height === '100%' || style.height === '100vh')) {
+              el.style.display = 'none';
+              el.remove();
+            }
+          });
+        }
+        
+        // Esegui il blocco iniziale
+        blockAds();
+        
+        // Configura un osservatore per rilevare dinamicamente gli annunci
+        const observer = new MutationObserver(function(mutations) {
+          blockAds();
+        });
+        
+        // Avvia l'osservazione
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true
+        });
+        
+        // Blocca anche i pop-up
+        window.open = function() { return null; };
+        
+        // Disabilita i redirect tramite location
+        const originalLocation = window.location;
+        let locationProxy = new Proxy(originalLocation, {
+          set: function(obj, prop, value) {
+            if (prop === 'href' || prop === 'replace') {
+              console.log('Tentativo di reindirizzamento bloccato a: ' + value);
+              return true; // Blocca il reindirizzamento
+            }
+            return Reflect.set(obj, prop, value);
+          }
+        });
+        
+        // Sostituisci l'oggetto location con il proxy
+        try {
+          Object.defineProperty(window, 'location', {
+            configurable: false,
+            get: function() { return locationProxy; },
+            set: function(val) { console.log('Reindirizzamento bloccato'); }
+          });
+        } catch(e) {
+          console.log('Non è stato possibile sostituire window.location', e);
+        }
+      })();
+    ''');
   }
   
   // Carica la posizione salvata
@@ -287,13 +631,26 @@ class _StreamingWebViewState extends State<StreamingWebView> {
             
             // Imposta un listener per gli eventi del video
             try {
-              video.addEventListener('timeupdate', function() {
+              // Traccia la posizione più frequentemente (ogni 5 secondi)
+              setInterval(function() {
                 if (!video.paused && video.currentTime > 0) {
                   PlaybackChannel.postMessage(video.currentTime.toString());
                 }
+              }, 5000);
+              
+              // Salva anche quando l'utente mette in pausa
+              video.addEventListener('pause', function() {
+                if (video.currentTime > 0) {
+                  PlaybackChannel.postMessage(video.currentTime.toString());
+                }
+              });
+              
+              // Salva quando il video termina
+              video.addEventListener('ended', function() {
+                PlaybackChannel.postMessage(video.currentTime.toString());
               });
             } catch(e) {
-              console.error('Errore nell\\'impostare l\\'evento timeupdate:', e);
+              console.error('Errore nell\\'impostare gli eventi del video:', e);
             }
           } else {
             retryCount++;
@@ -315,7 +672,7 @@ class _StreamingWebViewState extends State<StreamingWebView> {
   }
   
   // Salva la posizione di riproduzione quando si esce
-  Future<void> _savePlaybackPosition() async {
+  Future<void> _savePlaybackPosition({bool showNotification = true}) async {
     if (playbackPosition != null && playbackPosition! > 0) {
       await PlaybackPositionManager.savePosition(
         widget.mediaType, 
@@ -325,12 +682,14 @@ class _StreamingWebViewState extends State<StreamingWebView> {
         playbackPosition!
       );
       
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Posizione salvata: ${PlaybackPositionManager.formatTime(playbackPosition!)}'),
-          duration: const Duration(seconds: 2),
-        ),
-      );
+      if (showNotification && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Posizione salvata: ${PlaybackPositionManager.formatTime(playbackPosition!)}'),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      }
     }
   }
   
@@ -351,11 +710,17 @@ class _StreamingWebViewState extends State<StreamingWebView> {
   Widget build(BuildContext context) {
     return WillPopScope(
       onWillPop: () async {
+        // Se siamo in modalità fullscreen, esci da questa prima
+        if (_isFullScreen) {
+          _exitFullScreen();
+          return false; // Non chiudere la pagina, solo esci dal fullscreen
+        }
+        
         await _savePlaybackPosition();
         return true;
       },
       child: Scaffold(
-        appBar: AppBar(
+        appBar: _isFullScreen ? null : AppBar(
           title: Text(widget.title),
           actions: [
             if (playbackPosition != null)
@@ -369,9 +734,14 @@ class _StreamingWebViewState extends State<StreamingWebView> {
                 ),
               ),
             IconButton(
+              icon: const Icon(Icons.block),
+              tooltip: 'Blocca pubblicità',
+              onPressed: () => _injectAdBlocker(),
+            ),
+            IconButton(
               icon: const Icon(Icons.save),
               tooltip: 'Salva posizione',
-              onPressed: _savePlaybackPosition,
+              onPressed: () => _savePlaybackPosition(),
             ),
             IconButton(
               icon: const Icon(Icons.refresh),
@@ -383,6 +753,8 @@ class _StreamingWebViewState extends State<StreamingWebView> {
               onSelected: (value) {
                 if (value == 'browser') {
                   _openInBrowser(widget.url);
+                } else if (value == 'fullscreen') {
+                  _enterFullScreen();
                 }
               },
               itemBuilder: (context) => [
@@ -394,6 +766,14 @@ class _StreamingWebViewState extends State<StreamingWebView> {
                     contentPadding: EdgeInsets.zero,
                   ),
                 ),
+                const PopupMenuItem<String>(
+                  value: 'fullscreen',
+                  child: ListTile(
+                    leading: Icon(Icons.fullscreen),
+                    title: Text('Schermo intero'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
               ],
             ),
           ],
@@ -401,11 +781,11 @@ class _StreamingWebViewState extends State<StreamingWebView> {
         body: Stack(
           children: [
             WebViewWidget(controller: _controller),
-            if (isLoading)
+            if (isLoading && !_isFullScreen)
               const Center(
                 child: CircularProgressIndicator(),
               ),
-            if (hasError)
+            if (hasError && !_isFullScreen)
               Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -434,6 +814,8 @@ class _StreamingWebViewState extends State<StreamingWebView> {
                           onPressed: () => _controller.reload(),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Theme.of(context).primaryColor,
+                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                            minimumSize: const Size(120, 45),
                           ),
                         ),
                         const SizedBox(width: 16),
@@ -443,6 +825,8 @@ class _StreamingWebViewState extends State<StreamingWebView> {
                           onPressed: () => _openInBrowser(widget.url),
                           style: ElevatedButton.styleFrom(
                             backgroundColor: Colors.grey[700],
+                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                            minimumSize: const Size(120, 45),
                           ),
                         ),
                       ],
@@ -452,20 +836,26 @@ class _StreamingWebViewState extends State<StreamingWebView> {
               ),
           ],
         ),
-        bottomNavigationBar: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(8.0),
-            child: ElevatedButton.icon(
-              icon: const Icon(Icons.open_in_browser),
-              label: const Text('Problemi? Apri nel Browser'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.grey[800],
-                padding: const EdgeInsets.symmetric(vertical: 12),
+        bottomNavigationBar: _isFullScreen 
+            ? null 
+            : SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.all(8.0),
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.open_in_browser),
+                    label: const Text(
+                      'Problemi? Apri nel Browser',
+                      style: TextStyle(fontSize: 15),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.grey[800],
+                      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                      minimumSize: const Size(double.infinity, 48),
+                    ),
+                    onPressed: () => _openInBrowser(widget.url),
+                  ),
+                ),
               ),
-              onPressed: () => _openInBrowser(widget.url),
-            ),
-          ),
-        ),
       ),
     );
   }
@@ -952,7 +1342,9 @@ class StreamingApp extends StatelessWidget {
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(12),
             ),
-            padding: const EdgeInsets.symmetric(vertical: 12),
+            padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+            minimumSize: const Size(100, 45), // Dimensione minima per tutti i pulsanti
+            textStyle: const TextStyle(fontSize: 15), // Dimensione testo coerente
           ),
         ),
         useMaterial3: false,
@@ -1233,9 +1625,14 @@ class _SavedContentPageState extends State<SavedContentPage> {
                       const SizedBox(height: 24),
                       ElevatedButton.icon(
                         icon: const Icon(Icons.search),
-                        label: const Text('Cerca contenuti'),
+                        label: const Text(
+                          'Cerca contenuti',
+                          style: TextStyle(fontSize: 16),
+                        ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Theme.of(context).primaryColor,
+                          padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 24),
+                          minimumSize: const Size(200, 48),
                         ),
                         onPressed: () {
                           // Vai alla pagina di ricerca
@@ -1636,8 +2033,7 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
     
     // Verifica se il contenuto è disponibile
     bool isAvailable = await AvailabilityService.isContentAvailable(mediaType, id);
-    
-    if (!isAvailable) {
+        if (!isAvailable) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Questo contenuto non è disponibile per lo streaming")),
@@ -1962,35 +2358,8 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
             ),
           ),
           
-          // Mostra la posizione salvata se disponibile
-          if (savedPosition != null)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
-              child: Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).primaryColor.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Theme.of(context).primaryColor.withOpacity(0.5)),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.play_circle_outline, color: Colors.white70),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Riprendi da ${PlaybackPositionManager.formatTime(savedPosition!)}',
-                      style: const TextStyle(fontWeight: FontWeight.bold),
-                    ),
-                    const Spacer(),
-                    IconButton(
-                      icon: const Icon(Icons.play_arrow),
-                      tooltip: 'Riprendi',
-                      onPressed: () => openInWebView(context),
-                    ),
-                  ],
-                ),
-              ),
-            ),
+          // Utilizza i nuovi metodi per continua a guardare
+          _buildContinueWatchingWidget(),
           
           // Trama
           if (widget.item.overview != null && widget.item.overview!.isNotEmpty)
@@ -2066,10 +2435,14 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
                   width: double.infinity,
                   child: ElevatedButton.icon(
                     icon: const Icon(Icons.play_arrow),
-                    label: const Text("Guarda in WebView"),
+                    label: const Text(
+                      "Guarda in WebView",
+                      style: TextStyle(fontSize: 16),
+                    ),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Theme.of(context).primaryColor,
-                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+                      minimumSize: const Size(double.infinity, 50),
                     ),
                     onPressed: () => openInWebView(context),
                   ),
@@ -2082,10 +2455,14 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
                   width: double.infinity,
                   child: ElevatedButton.icon(
                     icon: const Icon(Icons.open_in_browser),
-                    label: const Text("Apri nel Browser"),
+                    label: const Text(
+                      "Apri nel Browser",
+                      style: TextStyle(fontSize: 16),
+                    ),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.grey[700],
-                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+                      minimumSize: const Size(double.infinity, 50),
                     ),
                     onPressed: () => openInBrowser(context),
                   ),
@@ -2094,6 +2471,148 @@ class _DetailPageState extends State<DetailPage> with SingleTickerProviderStateM
             ),
           ),
         ],
+      ),
+    );
+  }
+  
+  // Widget per continuare a guardare
+  Widget _buildContinueWatchingWidget() {
+    if (widget.item.mediaType == 'tv') {
+      return FutureBuilder<Map<String, dynamic>?>(
+        future: PlaybackPositionManager.getLastWatchedEpisode(widget.item.mediaType, widget.item.id),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const SizedBox.shrink();
+          }
+          
+          if (snapshot.hasData && snapshot.data != null) {
+            final lastEpisode = snapshot.data!;
+            final seasonNumber = lastEpisode['seasonNumber'];
+            final episodeNumber = lastEpisode['episodeNumber'];
+            final position = lastEpisode['position'] as double;
+            
+            return Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).primaryColor.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Theme.of(context).primaryColor.withOpacity(0.5)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.play_circle_outline, color: Colors.white70),
+                        const SizedBox(width: 8),
+                        const Text(
+                          'Continua a guardare',
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Stagione $seasonNumber, Episodio $episodeNumber (${PlaybackPositionManager.formatTime(position)})',
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        ElevatedButton.icon(
+                          icon: const Icon(Icons.play_arrow),
+                          label: const Text(
+                            'Riprendi',
+                            style: TextStyle(fontSize: 15),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Theme.of(context).primaryColor,
+                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                            minimumSize: const Size(120, 40),
+                          ),
+                          onPressed: () => openInWebView(
+                            context, 
+                            seasonNumber: seasonNumber, 
+                            episodeNumber: episodeNumber
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }
+          
+          // Se non ci sono dati sull'ultimo episodio, mostra comunque la posizione globale
+          if (savedPosition != null && savedPosition! > 0) {
+            return _buildMovieContinueWatchingWidget();
+          }
+          
+          return const SizedBox.shrink();
+        },
+      );
+    } else if (savedPosition != null && savedPosition! > 0) {
+      // Per i film, mostra il widget standard per continuare a guardare
+      return _buildMovieContinueWatchingWidget();
+    }
+    
+    return const SizedBox.shrink();
+  }
+
+  // Widget per continuare a guardare un film
+  Widget _buildMovieContinueWatchingWidget() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Theme.of(context).primaryColor.withOpacity(0.2),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Theme.of(context).primaryColor.withOpacity(0.5)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.play_circle_outline, color: Colors.white70),
+                const SizedBox(width: 8),
+                const Text(
+                  'Continua a guardare',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Riprendi da ${PlaybackPositionManager.formatTime(savedPosition!)}',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text(
+                    'Riprendi',
+                    style: TextStyle(fontSize: 15),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Theme.of(context).primaryColor,
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                    minimumSize: const Size(120, 40),
+                  ),
+                  onPressed: () => openInWebView(context),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -2603,10 +3122,14 @@ class _StreamingHomePageState extends State<StreamingHomePage> {
                   width: double.infinity,
                   child: ElevatedButton.icon(
                     icon: const Icon(Icons.play_arrow),
-                    label: const Text("Guarda in WebView"),
+                    label: const Text(
+                      "Guarda in WebView",
+                      style: TextStyle(fontSize: 16),
+                    ),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Theme.of(context).primaryColor,
-                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+                      minimumSize: const Size(double.infinity, 50),
                     ),
                     onPressed: () => openInWebView(linkToOpen!),
                   ),
@@ -2617,10 +3140,14 @@ class _StreamingHomePageState extends State<StreamingHomePage> {
                   width: double.infinity,
                   child: ElevatedButton.icon(
                     icon: const Icon(Icons.open_in_browser),
-                    label: const Text("Apri nel Browser"),
+                    label: const Text(
+                      "Apri nel Browser",
+                      style: TextStyle(fontSize: 16),
+                    ),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.grey[700],
-                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+                      minimumSize: const Size(double.infinity, 50),
                     ),
                     onPressed: () => openInBrowser(linkToOpen!),
                   ),
@@ -2630,11 +3157,14 @@ class _StreamingHomePageState extends State<StreamingHomePage> {
                   const SizedBox(height: 16),
                   ElevatedButton.icon(
                     icon: const Icon(Icons.info),
-                    label: const Text("Visualizza Dettagli"),
+                    label: const Text(
+                      "Visualizza Dettagli",
+                      style: TextStyle(fontSize: 16),
+                    ),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Theme.of(context).colorScheme.secondary,
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                      minimumSize: const Size(double.infinity, 0),
+                      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 20),
+                      minimumSize: const Size(double.infinity, 50),
                     ),
                     onPressed: () {
                       Navigator.push(
@@ -2984,252 +3514,340 @@ class _CatalogPageState extends State<CatalogPage> {
             ),
           ),
 
-          // Contenuto principale
+          // Campo di ricerca
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+            child: TextField(
+              decoration: InputDecoration(
+                hintText: 'Cerca nel catalogo',
+                prefixIcon: const Icon(Icons.search),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                filled: true,
+                fillColor: Theme.of(context).cardColor,
+                contentPadding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+              ),
+              onSubmitted: (query) {
+                if (query.trim().isNotEmpty) {
+                  setSearchQuery(query, selectedType);
+                }
+              },
+            ),
+          ),
+          
+          const SizedBox(height: 16),
+          
+          // Mostra informazioni sul catalogo
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  searchQuery != null 
+                      ? 'Risultati per "$searchQuery"' 
+                      : allTmdbIds.isEmpty 
+                          ? '' 
+                          : 'Titoli: ${loadedItemsCount}/${allTmdbIds.length}',
+                  style: const TextStyle(fontSize: 14, color: Colors.grey),
+                ),
+                if (_catalogService.isLoadingMore(selectedType))
+                  const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+              ],
+            ),
+          ),
+          
+          // Corpo principale con gli elementi del catalogo
           Expanded(
-            child: isLoading && items.isEmpty
-                ? const Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        CircularProgressIndicator(),
-                        SizedBox(height: 16),
-                        Text('Caricamento catalogo...'),
-                      ],
-                    ),
-                  )
-                : error.isNotEmpty && items.isEmpty
+            child: isLoading
+                ? const Center(child: CircularProgressIndicator())
+                : error.isNotEmpty
                     ? Center(
                         child: Padding(
                           padding: const EdgeInsets.all(16.0),
                           child: Column(
-                            mainAxisSize: MainAxisSize.min,
+                            mainAxisAlignment: MainAxisAlignment.center,
                             children: [
-                              Text(
-                                error, 
-                                style: const TextStyle(color: Colors.red),
-                                textAlign: TextAlign.center,
-                              ),
+                              const Icon(Icons.error_outline, size: 48, color: Colors.red),
                               const SizedBox(height: 16),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  ElevatedButton(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: Theme.of(context).primaryColor,
-                                    ),
-                                    onPressed: () => _catalogService.fetchCatalogIds(selectedType, setState),
-                                    child: const Text("Riprova"),
-                                  ),
-                                  const SizedBox(width: 16),
-                                  ElevatedButton(
-                                    onPressed: _viewRawApiResponse,
-                                    child: const Text("Vedi risposta API"),
-                                  ),
-                                ],
+                              Text(
+                                error,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(fontSize: 16),
+                              ),
+                              const SizedBox(height: 24),
+                              ElevatedButton.icon(
+                                icon: const Icon(Icons.refresh),
+                                label: const Text('Riprova'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Theme.of(context).primaryColor,
+                                ),
+                                onPressed: () {
+                                  if (searchQuery != null) {
+                                    _catalogService.searchInCatalog(searchQuery!, selectedType, setState);
+                                  } else {
+                                    _catalogService.fetchCatalogIds(selectedType, setState);
+                                  }
+                                },
                               ),
                             ],
                           ),
                         ),
                       )
                     : items.isEmpty
-                        ? const Center(
-                            child: Text('Nessun contenuto trovato'),
+                        ? Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                const Icon(Icons.movie_outlined, size: 64, color: Colors.grey),
+                                const SizedBox(height: 16),
+                                const Text(
+                                  'Nessun contenuto disponibile',
+                                  style: TextStyle(fontSize: 18),
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  'Prova a cambiare la ricerca o ricarica il catalogo',
+                                  style: TextStyle(color: Colors.grey),
+                                ),
+                                const SizedBox(height: 24),
+                                ElevatedButton.icon(
+                                  icon: const Icon(Icons.refresh),
+                                  label: const Text('Ricarica catalogo'),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Theme.of(context).primaryColor,
+                                  ),
+                                  onPressed: () {
+                                    setState(() {
+                                      searchQuery = null;
+                                      _catalogService.setSearchQuery(selectedType, '');
+                                    });
+                                    _catalogService.fetchCatalogIds(selectedType, setState);
+                                  },
+                                ),
+                              ],
+                            ),
                           )
-                        : Stack(
-                            children: [
-                              // Lista principale con RefreshIndicator
-                              RefreshIndicator(
-                                onRefresh: () => _catalogService.fetchCatalogIds(selectedType, setState),
-                                color: Theme.of(context).primaryColor,
-                                child: ListView.builder(
-                                  controller: _scrollController,
-                                  padding: const EdgeInsets.all(8),
-                                  itemCount: items.length + (loadedItemsCount < allTmdbIds.length ? 1 : 0),
-                                  itemBuilder: (context, index) {
-                                    // Se siamo all'ultimo elemento e ci sono ancora ID da caricare
-                                    if (index == items.length) {
-                                      return Container(
-                                        padding: const EdgeInsets.symmetric(vertical: 16),
-                                        alignment: Alignment.center,
-                                        child: CircularProgressIndicator(
-                                          color: Theme.of(context).primaryColor,
-                                        ),
-                                      );
-                                    }
-                                    
-                                    final item = items[index];
-                                    return Card(
-                                      shape: RoundedRectangleBorder(
-                                        borderRadius: BorderRadius.circular(12),
-                                      ),
-                                      clipBehavior: Clip.antiAlias,
-                                      elevation: 2,
-                                      margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-                                      child: InkWell(
-                                        onTap: () => openDetailPage(context, item),
-                                        child: Stack(
-                                          children: [
-                                            ListTile(
-                                              contentPadding: const EdgeInsets.all(12),
-                                              leading: Hero(
-                                                tag: 'poster_${item.id}_${item.mediaType}',
-                                                child: ClipRRect(
-                                                  borderRadius: BorderRadius.circular(8),
-                                                  child: item.posterPath != null
-                                                      ? Image.network(
-                                                          'https://image.tmdb.org/t/p/w92${item.posterPath}',
-                                                          width: 50,
-                                                          errorBuilder: (context, error, stackTrace) =>
-                                                              const Icon(Icons.movie, size: 50),
-                                                        )
-                                                      : const Icon(Icons.movie, size: 50),
-                                                ),
+                        : GridView.builder(
+                            padding: const EdgeInsets.all(16),
+                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 2,
+                              childAspectRatio: 0.7,
+                              crossAxisSpacing: 16,
+                              mainAxisSpacing: 16,
+                            ),
+                            controller: _scrollController,
+                            itemCount: items.length,
+                            itemBuilder: (context, index) {
+                              final item = items[index];
+                              return GestureDetector(
+                                onTap: () => openDetailPage(context, item),
+                                child: Card(
+                                  clipBehavior: Clip.antiAlias,
+                                  elevation: 2,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Stack(
+                                    fit: StackFit.expand,
+                                    children: [
+                                      // Poster
+                                      Hero(
+                                        tag: 'poster_${item.id}_${item.mediaType}',
+                                        child: item.posterPath != null
+                                            ? Image.network(
+                                                'https://image.tmdb.org/t/p/w342${item.posterPath}',
+                                                fit: BoxFit.cover,
+                                                errorBuilder: (context, error, stackTrace) =>
+                                                    Container(
+                                                      color: Theme.of(context).cardColor,
+                                                      child: const Icon(Icons.image_not_supported, size: 50),
+                                                    ),
+                                                loadingBuilder: (context, child, loadingProgress) {
+                                                  if (loadingProgress == null) return child;
+                                                  return Container(
+                                                    color: Theme.of(context).cardColor,
+                                                    child: const Center(
+                                                      child: CircularProgressIndicator(),
+                                                    ),
+                                                  );
+                                                },
+                                              )
+                                            : Container(
+                                                color: Theme.of(context).cardColor,
+                                                child: const Icon(Icons.movie, size: 50),
                                               ),
-                                              title: Hero(
+                                      ),
+                                      
+                                      // Gradiente dal basso verso l'alto per rendere leggibile il titolo
+                                      Positioned(
+                                        bottom: 0,
+                                        left: 0,
+                                        right: 0,
+                                        child: Container(
+                                          height: 120,
+                                          decoration: const BoxDecoration(
+                                            gradient: LinearGradient(
+                                              begin: Alignment.bottomCenter,
+                                              end: Alignment.topCenter,
+                                              colors: [Colors.black87, Colors.transparent],
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      
+                                      // Info
+                                      Positioned(
+                                        bottom: 0,
+                                        left: 0,
+                                        right: 0,
+                                        child: Padding(
+                                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                          child: Column(
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              // Titolo
+                                              Hero(
                                                 tag: 'title_${item.id}_${item.mediaType}',
                                                 child: Material(
                                                   color: Colors.transparent,
                                                   child: Text(
                                                     item.title,
-                                                    style: const TextStyle(fontWeight: FontWeight.bold),
+                                                    style: const TextStyle(
+                                                      color: Colors.white,
+                                                      fontWeight: FontWeight.bold,
+                                                      fontSize: 14,
+                                                    ),
+                                                    maxLines: 2,
+                                                    overflow: TextOverflow.ellipsis,
                                                   ),
                                                 ),
                                               ),
-                                              subtitle: Column(
-                                                crossAxisAlignment: CrossAxisAlignment.start,
-                                                children: [
-                                                  // Invece di mostrare l'ID, mostra la durata per i film o gli episodi per le serie
-                                                  if (item.mediaType == 'movie')
-                                                    item.runtime != null 
-                                                      ? Row(
-                                                          children: [
-                                                            const Icon(Icons.access_time, size: 14, color: Colors.grey),
-                                                            const SizedBox(width: 4),
-                                                            Text(_formatRuntime(item.runtime!)),
-                                                          ],
-                                                        )
-                                                      : const Text("Durata non disponibile"),
-                                                  if (item.mediaType == 'tv')
-                                                    Row(
-                                                      children: [
-                                                        const Icon(Icons.list, size: 14, color: Colors.grey),
-                                                        const SizedBox(width: 4),
-                                                        FutureBuilder<int>(
-                                                          future: _getEpisodeCount(item.id),
-                                                          builder: (context, snapshot) {
-                                                            if (snapshot.connectionState == ConnectionState.waiting) {
-                                                              return const Text("Caricamento episodi...");
-                                                            }
-                                                            if (snapshot.hasData && snapshot.data! > 0) {
-                                                              return Text("${snapshot.data} episodi");
-                                                            }
-                                                            return const Text("Episodi non disponibili");
-                                                          },
-                                                        ),
-                                                      ],
-                                                    ),
-                                                  if (item.releaseDate != null && item.releaseDate!.isNotEmpty)
-                                                    Text(
-                                                      "Anno: ${item.releaseDate!.length >= 4 
-                                                          ? item.releaseDate!.substring(0, 4) 
-                                                          : item.releaseDate!}"
-                                                    ),
-                                                ],
-                                              ),
-                                              trailing: Container(
-                                                width: 40,
-                                                height: 40,
-                                                decoration: BoxDecoration(
-                                                  color: Theme.of(context).primaryColor.withOpacity(0.2),
-                                                  borderRadius: BorderRadius.circular(20),
+                                              
+                                              const SizedBox(height: 4),
+                                              
+                                              // Anno o rating
+                                              if (item.releaseDate != null && item.releaseDate!.isNotEmpty)
+                                                Text(
+                                                  item.releaseDate!.length >= 4
+                                                      ? item.releaseDate!.substring(0, 4)
+                                                      : item.releaseDate!,
+                                                  style: const TextStyle(
+                                                    color: Colors.grey,
+                                                    fontSize: 12,
+                                                  ),
                                                 ),
-                                                child: IconButton(
-                                                  icon: const Icon(Icons.play_arrow, size: 22, color: Colors.white),
-                                                  padding: EdgeInsets.zero,
-                                                  onPressed: () => openInWebView(context, item),
-                                                  tooltip: 'Guarda in WebView',
-                                                ),
-                                              ),
+                                              
+                                              const SizedBox(height: 8),
+// Pulsante per guardare
+Row(
+  mainAxisAlignment: MainAxisAlignment.end,
+  children: [
+    Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: () => openInWebView(context, item),
+        borderRadius: BorderRadius.circular(20),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.8),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: Theme.of(context).primaryColor.withOpacity(0.5),
+              width: 1,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Sostituire il CircularProgressIndicator con un'icona play statica
+              Icon(
+                Icons.play_arrow,
+                size: 16,
+                color: Theme.of(context).primaryColor,
+              ),
+              const SizedBox(width: 8),
+              const Text(
+                'Play',
+                style: TextStyle(color: Colors.white, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  ],
+),
+                                              
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                      
+                                      // Badge tipo (film/serie)
+                                      Positioned(
+                                        top: 8,
+                                        right: 8,
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                          decoration: BoxDecoration(
+                                            color: item.mediaType == 'movie' 
+                                                ? Colors.blue.withOpacity(0.8) 
+                                                : Colors.purple.withOpacity(0.8),
+                                            borderRadius: BorderRadius.circular(12),
+                                          ),
+                                          child: Text(
+                                            item.mediaType == 'movie' ? 'Film' : 'TV',
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 10,
+                                              fontWeight: FontWeight.bold,
                                             ),
-                                            // Posiziona un chip per il tempo salvato, se presente
-                                            FutureBuilder<double?>(
-                                              future: PlaybackPositionManager.getPosition(
-                                                item.mediaType, 
-                                                item.id, 
-                                                null, 
-                                                null
-                                              ),
-                                              builder: (context, snapshot) {
-                                                if (snapshot.hasData && snapshot.data != null && snapshot.data! > 0) {
-                                                  return Positioned(
-                                                    bottom: 8,
-                                                    right: 60,
-                                                    child: Container(
-                                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                                      decoration: BoxDecoration(
-                                                        color: Theme.of(context).primaryColor,
-                                                        borderRadius: BorderRadius.circular(4),
-                                                      ),
-                                                      child: Text(
-                                                        PlaybackPositionManager.formatTime(snapshot.data!),
-                                                        style: const TextStyle(
-                                                          fontSize: 10,
-                                                          fontWeight: FontWeight.bold,
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  );
-                                                }
+                                          ),
+                                        ),
+                                      ),
+                                      
+                                      // Se la serie TV, badge con numero episodi
+                                      if (item.mediaType == 'tv')
+                                        Positioned(
+                                          top: 8,
+                                          left: 8,
+                                          child: FutureBuilder<int>(
+                                            future: _getEpisodeCount(item.id),
+                                            builder: (context, snapshot) {
+                                              if (!snapshot.hasData || snapshot.data == 0) {
                                                 return const SizedBox.shrink();
-                                              },
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    );
-                                  },
-                                ),
-                              ),
-                              
-                              // Indicatore durante il caricamento
-                              if (isLoading && items.isNotEmpty)
-                                Positioned(
-                                  bottom: 16,
-                                  left: 0,
-                                  right: 0,
-                                  child: Center(
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                                      decoration: BoxDecoration(
-                                        color: Colors.black.withOpacity(0.8),
-                                        borderRadius: BorderRadius.circular(20),
-                                        border: Border.all(
-                                          color: Theme.of(context).primaryColor.withOpacity(0.5),
-                                          width: 1,
-                                        ),
-                                      ),
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          SizedBox(
-                                            width: 16,
-                                            height: 16,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                              color: Theme.of(context).primaryColor,
-                                            ),
+                                              }
+                                              return Container(
+                                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                                decoration: BoxDecoration(
+                                                  color: Colors.black.withOpacity(0.8),
+                                                  borderRadius: BorderRadius.circular(12),
+                                                ),
+                                                child: Text(
+                                                  '${snapshot.data} ep',
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 10,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                              );
+                                            },
                                           ),
-                                          const SizedBox(width: 12),
-                                          const Text(
-                                            'Caricamento titoli...',
-                                            style: TextStyle(color: Colors.white),
-                                          ),
-                                        ],
-                                      ),
-                                    ),
+                                        ),
+                                    ],
                                   ),
                                 ),
-                            ],
+                              );
+                            },
                           ),
           ),
         ],
