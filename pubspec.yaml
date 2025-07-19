@@ -12,8 +12,13 @@ dependencies:
   cupertino_icons: ^1.0.8
   http: ^1.2.1
   url_launcher: ^6.2.6
-  shared_preferences: ^2.2.2  # Added shared_preferences
+  shared_preferences: ^2.2.2
   webview_flutter: ^4.4.2
+  
+  # Firebase
+  firebase_core: ^2.15.1
+  firebase_auth: ^4.7.3
+  cloud_firestore: ^4.8.5
 
 dev_dependencies:
   flutter_test:
