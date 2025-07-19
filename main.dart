@@ -228,7 +228,6 @@ class _StreamingWebViewState extends State<StreamingWebView> {
   double? playbackPosition;
   bool hasInjectedJs = false;
   Timer? _autoSaveTimer; // Timer per il salvataggio automatico
-  bool _isFullScreen = false; // Traccia lo stato della modalità a schermo intero
   
   @override
   void initState() {
@@ -259,7 +258,6 @@ class _StreamingWebViewState extends State<StreamingWebView> {
             if (!hasInjectedJs) {
               _injectPlaybackTracker();
               _injectAdBlocker(); // Aggiungiamo il blocco pubblicità
-              _injectFullscreenDetector(); // Aggiungiamo il rilevatore fullscreen
               hasInjectedJs = true;
             }
           },
@@ -313,139 +311,16 @@ class _StreamingWebViewState extends State<StreamingWebView> {
           }
         },
       )
-      // Nuovo canale JavaScript per rilevare i cambiamenti del fullscreen
-      ..addJavaScriptChannel(
-        'FullscreenChannel',
-        onMessageReceived: (JavaScriptMessage message) {
-          if (message.message == 'enter') {
-            _enterFullScreen();
-          } else if (message.message == 'exit') {
-            _exitFullScreen();
-          }
-        },
-      )
       ..loadRequest(Uri.parse(widget.url));
   }
   
   @override
   void dispose() {
-    // Assicurati di uscire dalla modalità fullscreen quando si chiude la pagina
-    if (_isFullScreen) {
-      _exitFullScreen();
-    }
-    
     // Cancella il timer quando la pagina viene chiusa
     _autoSaveTimer?.cancel();
     // Salva la posizione finale quando l'utente esce
     _savePlaybackPosition(showNotification: false);
     super.dispose();
-  }
-  
-  // Metodo per entrare in modalità fullscreen
-  void _enterFullScreen() {
-    if (!_isFullScreen) {
-      setState(() {
-        _isFullScreen = true;
-      });
-      // Nascondi tutti gli elementi dell'interfaccia di sistema
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    }
-  }
-  
-  // Metodo per uscire dalla modalità fullscreen
-  void _exitFullScreen() {
-    if (_isFullScreen) {
-      setState(() {
-        _isFullScreen = false;
-      });
-      // Ripristina l'interfaccia di sistema normale
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    }
-  }
-  
-  // Aggiungi questo metodo per rilevare quando il contenuto web entra/esce dal fullscreen
-  void _injectFullscreenDetector() {
-    _controller.runJavaScript('''
-      (function() {
-        // Lista di possibili eventi di cambio fullscreen in diversi browser
-        const fullscreenEvents = [
-          'fullscreenchange',
-          'webkitfullscreenchange',
-          'mozfullscreenchange',
-          'MSFullscreenChange'
-        ];
-        
-        // Funzione per controllare se siamo in fullscreen
-        function checkFullscreen() {
-          const isFullscreen = !!(
-            document.fullscreenElement ||
-            document.webkitFullscreenElement ||
-            document.mozFullScreenElement ||
-            document.msFullscreenElement
-          );
-          
-          // Comunica lo stato fullscreen all'app Flutter
-          if (isFullscreen) {
-            FullscreenChannel.postMessage('enter');
-          } else {
-            FullscreenChannel.postMessage('exit');
-          }
-        }
-        
-        // Aggiungi event listener per tutti i possibili eventi di fullscreen
-        fullscreenEvents.forEach(eventName => {
-          document.addEventListener(eventName, checkFullscreen);
-        });
-        
-        // Monitora anche i video che potrebbero entrare in modalità fullscreen
-        function monitorVideoFullscreen() {
-          const videos = document.querySelectorAll('video');
-          videos.forEach(video => {
-            // Aggiungi eventi di controllo alle proprietà fullscreen
-            if (!video._hasFullscreenListeners) {
-              video._hasFullscreenListeners = true;
-              
-              // Eventi specifici per iOS
-              video.addEventListener('webkitbeginfullscreen', function() {
-                console.log('Video entered fullscreen');
-                FullscreenChannel.postMessage('enter');
-              });
-              
-              video.addEventListener('webkitendfullscreen', function() {
-                console.log('Video exited fullscreen');
-                FullscreenChannel.postMessage('exit');
-              });
-              
-              // Eventi Picture-in-Picture
-              video.addEventListener('enterpictureinpicture', function() {
-                console.log('Entered PiP mode');
-                FullscreenChannel.postMessage('enter');
-              });
-              
-              video.addEventListener('leavepictureinpicture', function() {
-                console.log('Left PiP mode');
-                FullscreenChannel.postMessage('exit');
-              });
-            }
-          });
-        }
-        
-        // Esegui subito e controlla periodicamente per nuovi video
-        monitorVideoFullscreen();
-        setInterval(monitorVideoFullscreen, 1000);
-        
-        // Inoltre, osserva le mutazioni del DOM per rilevare nuovi video
-        const observer = new MutationObserver(function(mutations) {
-          monitorVideoFullscreen();
-        });
-        
-        // Avvia l'osservazione
-        observer.observe(document.body, {
-          childList: true,
-          subtree: true
-        });
-      })();
-    ''');
   }
   
   // Verifica se un URL è pubblicitario
@@ -710,17 +585,11 @@ class _StreamingWebViewState extends State<StreamingWebView> {
   Widget build(BuildContext context) {
     return WillPopScope(
       onWillPop: () async {
-        // Se siamo in modalità fullscreen, esci da questa prima
-        if (_isFullScreen) {
-          _exitFullScreen();
-          return false; // Non chiudere la pagina, solo esci dal fullscreen
-        }
-        
         await _savePlaybackPosition();
         return true;
       },
       child: Scaffold(
-        appBar: _isFullScreen ? null : AppBar(
+        appBar: AppBar(
           title: Text(widget.title),
           actions: [
             if (playbackPosition != null)
@@ -753,8 +622,6 @@ class _StreamingWebViewState extends State<StreamingWebView> {
               onSelected: (value) {
                 if (value == 'browser') {
                   _openInBrowser(widget.url);
-                } else if (value == 'fullscreen') {
-                  _enterFullScreen();
                 }
               },
               itemBuilder: (context) => [
@@ -766,14 +633,6 @@ class _StreamingWebViewState extends State<StreamingWebView> {
                     contentPadding: EdgeInsets.zero,
                   ),
                 ),
-                const PopupMenuItem<String>(
-                  value: 'fullscreen',
-                  child: ListTile(
-                    leading: Icon(Icons.fullscreen),
-                    title: Text('Schermo intero'),
-                    contentPadding: EdgeInsets.zero,
-                  ),
-                ),
               ],
             ),
           ],
@@ -781,11 +640,11 @@ class _StreamingWebViewState extends State<StreamingWebView> {
         body: Stack(
           children: [
             WebViewWidget(controller: _controller),
-            if (isLoading && !_isFullScreen)
+            if (isLoading)
               const Center(
                 child: CircularProgressIndicator(),
               ),
-            if (hasError && !_isFullScreen)
+            if (hasError)
               Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -836,26 +695,24 @@ class _StreamingWebViewState extends State<StreamingWebView> {
               ),
           ],
         ),
-        bottomNavigationBar: _isFullScreen 
-            ? null 
-            : SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.all(8.0),
-                  child: ElevatedButton.icon(
-                    icon: const Icon(Icons.open_in_browser),
-                    label: const Text(
-                      'Problemi? Apri nel Browser',
-                      style: TextStyle(fontSize: 15),
-                    ),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.grey[800],
-                      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
-                      minimumSize: const Size(double.infinity, 48),
-                    ),
-                    onPressed: () => _openInBrowser(widget.url),
-                  ),
-                ),
+        bottomNavigationBar: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.open_in_browser),
+              label: const Text(
+                'Problemi? Apri nel Browser',
+                style: TextStyle(fontSize: 15),
               ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.grey[800],
+                padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+                minimumSize: const Size(double.infinity, 48),
+              ),
+              onPressed: () => _openInBrowser(widget.url),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -3221,6 +3078,10 @@ class _CatalogPageState extends State<CatalogPage> {
   final ScrollController _scrollController = ScrollController();
   final double _scrollThreshold = 200.0; // Soglia di scorrimento per caricare più titoli
   
+  // Lista dei contenuti iniziati
+  List<CatalogItem> _continueWatchingItems = [];
+  bool _isLoadingContinueWatching = false;
+  
   @override
   void initState() {
     super.initState();
@@ -3228,6 +3089,9 @@ class _CatalogPageState extends State<CatalogPage> {
     
     // Carica i generi all'inizio
     _catalogService.loadGenres();
+    
+    // Carica i contenuti iniziati
+    _loadContinueWatchingItems();
     
     // Verifica se c'è una ricerca pendente
     if (SearchService.pendingSearchQuery != null) {
@@ -3242,6 +3106,74 @@ class _CatalogPageState extends State<CatalogPage> {
       });
     } else {
       _loadCatalogIfNeeded();
+    }
+  }
+  
+  // Carica i contenuti che l'utente ha iniziato a guardare
+  Future<void> _loadContinueWatchingItems() async {
+    setState(() {
+      _isLoadingContinueWatching = true;
+    });
+    
+    try {
+      // Inizializza il gestore delle posizioni
+      await PlaybackPositionManager.initialize();
+      
+      // Ottieni tutte le posizioni salvate
+      final positions = PlaybackPositionManager._positions;
+      
+      List<CatalogItem> watchingItems = [];
+      
+      // Per ogni posizione, carica i dettagli del contenuto
+      for (var entry in positions.entries) {
+        try {
+          final parts = entry.key.split(':');
+          if (parts.length >= 2) {
+            final mediaType = parts[0];
+            final id = int.tryParse(parts[1]);
+            
+            if (id != null) {
+              // Carica i dettagli del contenuto da TMDB
+              final url = 'https://api.themoviedb.org/3/$mediaType/$id?api_key=${CatalogService.apiKey}&language=it';
+              final response = await http.get(Uri.parse(url));
+              
+              if (response.statusCode == 200) {
+                final data = json.decode(response.body);
+                
+                // Crea un CatalogItem dal risultato
+                final item = CatalogItem(
+                  id: id,
+                  title: mediaType == 'movie' ? data['title'] : data['name'],
+                  posterPath: data['poster_path'],
+                  overview: data['overview'],
+                  releaseDate: mediaType == 'movie' ? data['release_date'] : data['first_air_date'],
+                  voteAverage: data['vote_average']?.toDouble(),
+                  mediaType: mediaType,
+                  runtime: data['runtime'],
+                );
+                
+                watchingItems.add(item);
+              }
+            }
+          }
+        } catch (e) {
+          print('Errore nel caricamento di un elemento iniziato: $e');
+        }
+      }
+      
+      if (mounted) {
+        setState(() {
+          _continueWatchingItems = watchingItems;
+          _isLoadingContinueWatching = false;
+        });
+      }
+    } catch (e) {
+      print('Errore nel caricamento dei contenuti iniziati: $e');
+      if (mounted) {
+        setState(() {
+          _isLoadingContinueWatching = false;
+        });
+      }
     }
   }
   
@@ -3414,6 +3346,199 @@ class _CatalogPageState extends State<CatalogPage> {
     }
   }
 
+  // Widget per visualizzare gli elementi "Continua a guardare"
+  Widget _buildContinueWatchingSection() {
+    // Filtra gli elementi in base al tipo selezionato
+    final filteredItems = _continueWatchingItems
+        .where((item) => item.mediaType == selectedType)
+        .toList();
+    
+    if (filteredItems.isEmpty) {
+      return const SizedBox.shrink(); // Non mostrare nulla se non ci sono elementi
+    }
+    
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Text(
+            'Continua a guardare',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: Theme.of(context).primaryColor,
+            ),
+          ),
+        ),
+        SizedBox(
+          height: 210, // MODIFICATO: Aumentato da 200 a 210
+          child: ListView.builder(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            itemCount: filteredItems.length,
+            itemBuilder: (context, index) {
+              final item = filteredItems[index];
+              return _buildContinueWatchingItem(item);
+            },
+          ),
+        ),
+        const SizedBox(height: 8),
+        const Divider(),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+          child: Text(
+            selectedType == 'movie' ? 'Film popolari' : 'Serie TV popolari',
+            style: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
+              color: Theme.of(context).primaryColor,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+  
+  // Widget per un singolo elemento "Continua a guardare"
+  Widget _buildContinueWatchingItem(CatalogItem item) {
+    return GestureDetector(
+      onTap: () => openDetailPage(context, item),
+      child: Container(
+        width: 140,
+        margin: const EdgeInsets.symmetric(horizontal: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Poster con indicatore di progresso
+            Stack(
+              children: [
+                // Poster
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: item.posterPath != null
+                      ? Image.network(
+                          'https://image.tmdb.org/t/p/w200${item.posterPath}',
+                          height: 145, // MODIFICATO: Ridotto da 150 a 145
+                          width: 140,
+                          fit: BoxFit.cover,
+                          errorBuilder: (context, error, stackTrace) =>
+                              Container(
+                                height: 145, // MODIFICATO: Ridotto da 150 a 145
+                                width: 140,
+                                color: Theme.of(context).cardColor,
+                                child: const Icon(Icons.image_not_supported, size: 40),
+                              ),
+                        )
+                      : Container(
+                          height: 145, // MODIFICATO: Ridotto da 150 a 145
+                          width: 140,
+                          color: Theme.of(context).cardColor,
+                          child: const Icon(Icons.movie, size: 40),
+                        ),
+                ),
+                
+                // Badge "Continua" in basso
+                Positioned(
+                  bottom: 0,
+                  left: 0,
+                  right: 0,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [
+                          Colors.transparent,
+                          Colors.black.withOpacity(0.8),
+                        ],
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.play_circle_outline, color: Colors.white, size: 16),
+                        const SizedBox(width: 4),
+                        const Text(
+                          'Continua',
+                          style: TextStyle(color: Colors.white, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                
+                // Indicatore di progresso
+                FutureBuilder<double?>(
+                  future: PlaybackPositionManager.getPosition(
+                    item.mediaType, 
+                    item.id, 
+                    null, 
+                    null
+                  ),
+                  builder: (context, snapshot) {
+                    if (!snapshot.hasData || snapshot.data == null) {
+                      return const SizedBox.shrink();
+                    }
+                    
+                    final position = snapshot.data!;
+                    
+                    return Positioned(
+                      bottom: 0,
+                      left: 0,
+                      right: 0,
+                      child: Container(
+                        height: 3,
+                        margin: const EdgeInsets.only(bottom: 30),
+                        decoration: BoxDecoration(
+                          color: Colors.grey.withOpacity(0.3),
+                        ),
+                        child: FractionallySizedBox(
+                          widthFactor: 0.5, // Andrà sostituito con un valore reale
+                          alignment: Alignment.centerLeft,
+                          child: Container(
+                            color: Theme.of(context).primaryColor,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ),
+            
+            // Titolo
+            Padding(
+              padding: const EdgeInsets.only(top: 4.0), // MODIFICATO: Ridotto da 8 a 4
+              child: Text(
+                item.title,
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 14,
+                ),
+                maxLines: 1, // MODIFICATO: Limitato a 1 riga invece di 2
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            
+            // Data di rilascio
+            if (item.releaseDate != null && item.releaseDate!.isNotEmpty)
+              Text(
+                item.releaseDate!.length >= 4
+                    ? item.releaseDate!.substring(0, 4)
+                    : item.releaseDate!,
+                style: const TextStyle(
+                  color: Colors.grey,
+                  fontSize: 12,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final items = _catalogService.getItems(selectedType);
@@ -3458,6 +3583,8 @@ class _CatalogPageState extends State<CatalogPage> {
                 _catalogService.setSearchQuery(selectedType, '');
               });
               _catalogService.fetchCatalogIds(selectedType, setState);
+              // Ricarica anche i contenuti iniziati
+              _loadContinueWatchingItems();
             },
           ),
         ],
@@ -3633,221 +3760,234 @@ class _CatalogPageState extends State<CatalogPage> {
                               ],
                             ),
                           )
-                        : GridView.builder(
-                            padding: const EdgeInsets.all(16),
-                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                              crossAxisCount: 2,
-                              childAspectRatio: 0.7,
-                              crossAxisSpacing: 16,
-                              mainAxisSpacing: 16,
-                            ),
+                        : CustomScrollView(
                             controller: _scrollController,
-                            itemCount: items.length,
-                            itemBuilder: (context, index) {
-                              final item = items[index];
-                              return GestureDetector(
-                                onTap: () => openDetailPage(context, item),
-                                child: Card(
-                                  clipBehavior: Clip.antiAlias,
-                                  elevation: 2,
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
+                            slivers: [
+                              // Sezione "Continua a guardare"
+                              if (_continueWatchingItems.isNotEmpty)
+                                SliverToBoxAdapter(
+                                  child: _buildContinueWatchingSection(),
+                                ),
+                                
+                              // Griglia del catalogo
+                              SliverPadding(
+                                padding: const EdgeInsets.all(16),
+                                sliver: SliverGrid(
+                                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: 2,
+                                    childAspectRatio: 0.7,
+                                    crossAxisSpacing: 16,
+                                    mainAxisSpacing: 16,
                                   ),
-                                  child: Stack(
-                                    fit: StackFit.expand,
-                                    children: [
-                                      // Poster
-                                      Hero(
-                                        tag: 'poster_${item.id}_${item.mediaType}',
-                                        child: item.posterPath != null
-                                            ? Image.network(
-                                                'https://image.tmdb.org/t/p/w342${item.posterPath}',
-                                                fit: BoxFit.cover,
-                                                errorBuilder: (context, error, stackTrace) =>
-                                                    Container(
-                                                      color: Theme.of(context).cardColor,
-                                                      child: const Icon(Icons.image_not_supported, size: 50),
-                                                    ),
-                                                loadingBuilder: (context, child, loadingProgress) {
-                                                  if (loadingProgress == null) return child;
-                                                  return Container(
-                                                    color: Theme.of(context).cardColor,
-                                                    child: const Center(
-                                                      child: CircularProgressIndicator(),
-                                                    ),
-                                                  );
-                                                },
-                                              )
-                                            : Container(
-                                                color: Theme.of(context).cardColor,
-                                                child: const Icon(Icons.movie, size: 50),
-                                              ),
-                                      ),
-                                      
-                                      // Gradiente dal basso verso l'alto per rendere leggibile il titolo
-                                      Positioned(
-                                        bottom: 0,
-                                        left: 0,
-                                        right: 0,
-                                        child: Container(
-                                          height: 120,
-                                          decoration: const BoxDecoration(
-                                            gradient: LinearGradient(
-                                              begin: Alignment.bottomCenter,
-                                              end: Alignment.topCenter,
-                                              colors: [Colors.black87, Colors.transparent],
-                                            ),
+                                  delegate: SliverChildBuilderDelegate(
+                                    (context, index) {
+                                      final item = items[index];
+                                      return GestureDetector(
+                                        onTap: () => openDetailPage(context, item),
+                                        child: Card(
+                                          clipBehavior: Clip.antiAlias,
+                                          elevation: 2,
+                                          shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(12),
                                           ),
-                                        ),
-                                      ),
-                                      
-                                      // Info
-                                      Positioned(
-                                        bottom: 0,
-                                        left: 0,
-                                        right: 0,
-                                        child: Padding(
-                                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                                          child: Column(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
-                                            mainAxisSize: MainAxisSize.min,
+                                          child: Stack(
+                                            fit: StackFit.expand,
                                             children: [
-                                              // Titolo
+                                              // Poster
                                               Hero(
-                                                tag: 'title_${item.id}_${item.mediaType}',
-                                                child: Material(
-                                                  color: Colors.transparent,
+                                                tag: 'poster_${item.id}_${item.mediaType}',
+                                                child: item.posterPath != null
+                                                    ? Image.network(
+                                                        'https://image.tmdb.org/t/p/w342${item.posterPath}',
+                                                        fit: BoxFit.cover,
+                                                        errorBuilder: (context, error, stackTrace) =>
+                                                            Container(
+                                                              color: Theme.of(context).cardColor,
+                                                              child: const Icon(Icons.image_not_supported, size: 50),
+                                                            ),
+                                                        loadingBuilder: (context, child, loadingProgress) {
+                                                          if (loadingProgress == null) return child;
+                                                          return Container(
+                                                            color: Theme.of(context).cardColor,
+                                                            child: const Center(
+                                                              child: CircularProgressIndicator(),
+                                                            ),
+                                                          );
+                                                        },
+                                                      )
+                                                    : Container(
+                                                        color: Theme.of(context).cardColor,
+                                                        child: const Icon(Icons.movie, size: 50),
+                                                      ),
+                                              ),
+                                              
+                                              // Gradiente dal basso verso l'alto per rendere leggibile il titolo
+                                              Positioned(
+                                                bottom: 0,
+                                                left: 0,
+                                                right: 0,
+                                                child: Container(
+                                                  height: 120,
+                                                  decoration: const BoxDecoration(
+                                                    gradient: LinearGradient(
+                                                      begin: Alignment.bottomCenter,
+                                                      end: Alignment.topCenter,
+                                                      colors: [Colors.black87, Colors.transparent],
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                              
+                                              // Info
+                                              Positioned(
+                                                bottom: 0,
+                                                left: 0,
+                                                right: 0,
+                                                child: Padding(
+                                                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                                  child: Column(
+                                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                                    mainAxisSize: MainAxisSize.min,
+                                                    children: [
+                                                      // Titolo
+                                                      Hero(
+                                                        tag: 'title_${item.id}_${item.mediaType}',
+                                                        child: Material(
+                                                          color: Colors.transparent,
+                                                          child: Text(
+                                                            item.title,
+                                                            style: const TextStyle(
+                                                              color: Colors.white,
+                                                              fontWeight: FontWeight.bold,
+                                                              fontSize: 14,
+                                                            ),
+                                                            maxLines: 2,
+                                                            overflow: TextOverflow.ellipsis,
+                                                          ),
+                                                        ),
+                                                      ),
+                                                      
+                                                      const SizedBox(height: 4),
+                                                      
+                                                      // Anno o rating
+                                                      if (item.releaseDate != null && item.releaseDate!.isNotEmpty)
+                                                        Text(
+                                                          item.releaseDate!.length >= 4
+                                                              ? item.releaseDate!.substring(0, 4)
+                                                              : item.releaseDate!,
+                                                          style: const TextStyle(
+                                                            color: Colors.grey,
+                                                            fontSize: 12,
+                                                          ),
+                                                        ),
+                                                      
+                                                      const SizedBox(height: 8),
+                                                      // Pulsante per guardare
+                                                      Row(
+                                                        mainAxisAlignment: MainAxisAlignment.end,
+                                                        children: [
+                                                          Material(
+                                                            color: Colors.transparent,
+                                                            child: InkWell(
+                                                              onTap: () => openInWebView(context, item),
+                                                              borderRadius: BorderRadius.circular(20),
+                                                              child: Container(
+                                                                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                                                decoration: BoxDecoration(
+                                                                  color: Colors.black.withOpacity(0.8),
+                                                                  borderRadius: BorderRadius.circular(20),
+                                                                  border: Border.all(
+                                                                    color: Theme.of(context).primaryColor.withOpacity(0.5),
+                                                                    width: 1,
+                                                                  ),
+                                                                ),
+                                                                child: Row(
+                                                                  mainAxisSize: MainAxisSize.min,
+                                                                  children: [
+                                                                    Icon(
+                                                                      Icons.play_arrow,
+                                                                      size: 16,
+                                                                      color: Theme.of(context).primaryColor,
+                                                                    ),
+                                                                    const SizedBox(width: 8),
+                                                                    const Text(
+                                                                      'Play',
+                                                                      style: TextStyle(color: Colors.white, fontSize: 12),
+                                                                    ),
+                                                                  ],
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    ],
+                                                  ),
+                                                ),
+                                              ),
+                                              
+                                              // Badge tipo (film/serie)
+                                              Positioned(
+                                                top: 8,
+                                                right: 8,
+                                                child: Container(
+                                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                                  decoration: BoxDecoration(
+                                                    color: item.mediaType == 'movie' 
+                                                        ? Colors.blue.withOpacity(0.8) 
+                                                        : Colors.purple.withOpacity(0.8),
+                                                    borderRadius: BorderRadius.circular(12),
+                                                  ),
                                                   child: Text(
-                                                    item.title,
+                                                    item.mediaType == 'movie' ? 'Film' : 'TV',
                                                     style: const TextStyle(
                                                       color: Colors.white,
+                                                      fontSize: 10,
                                                       fontWeight: FontWeight.bold,
-                                                      fontSize: 14,
                                                     ),
-                                                    maxLines: 2,
-                                                    overflow: TextOverflow.ellipsis,
                                                   ),
                                                 ),
                                               ),
                                               
-                                              const SizedBox(height: 4),
-                                              
-                                              // Anno o rating
-                                              if (item.releaseDate != null && item.releaseDate!.isNotEmpty)
-                                                Text(
-                                                  item.releaseDate!.length >= 4
-                                                      ? item.releaseDate!.substring(0, 4)
-                                                      : item.releaseDate!,
-                                                  style: const TextStyle(
-                                                    color: Colors.grey,
-                                                    fontSize: 12,
+                                              // Se la serie TV, badge con numero episodi
+                                              if (item.mediaType == 'tv')
+                                                Positioned(
+                                                  top: 8,
+                                                  left: 8,
+                                                  child: FutureBuilder<int>(
+                                                    future: _getEpisodeCount(item.id),
+                                                    builder: (context, snapshot) {
+                                                      if (!snapshot.hasData || snapshot.data == 0) {
+                                                        return const SizedBox.shrink();
+                                                      }
+                                                      return Container(
+                                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                                        decoration: BoxDecoration(
+                                                          color: Colors.black.withOpacity(0.8),
+                                                          borderRadius: BorderRadius.circular(12),
+                                                        ),
+                                                        child: Text(
+                                                          '${snapshot.data} ep',
+                                                          style: const TextStyle(
+                                                            color: Colors.white,
+                                                            fontSize: 10,
+                                                            fontWeight: FontWeight.bold,
+                                                          ),
+                                                        ),
+                                                      );
+                                                    },
                                                   ),
                                                 ),
-                                              
-                                              const SizedBox(height: 8),
-// Pulsante per guardare
-Row(
-  mainAxisAlignment: MainAxisAlignment.end,
-  children: [
-    Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: () => openInWebView(context, item),
-        borderRadius: BorderRadius.circular(20),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          decoration: BoxDecoration(
-            color: Colors.black.withOpacity(0.8),
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(
-              color: Theme.of(context).primaryColor.withOpacity(0.5),
-              width: 1,
-            ),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // Sostituire il CircularProgressIndicator con un'icona play statica
-              Icon(
-                Icons.play_arrow,
-                size: 16,
-                color: Theme.of(context).primaryColor,
-              ),
-              const SizedBox(width: 8),
-              const Text(
-                'Play',
-                style: TextStyle(color: Colors.white, fontSize: 12),
-              ),
-            ],
-          ),
-        ),
-      ),
-    ),
-  ],
-),
-                                              
                                             ],
                                           ),
                                         ),
-                                      ),
-                                      
-                                      // Badge tipo (film/serie)
-                                      Positioned(
-                                        top: 8,
-                                        right: 8,
-                                        child: Container(
-                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                          decoration: BoxDecoration(
-                                            color: item.mediaType == 'movie' 
-                                                ? Colors.blue.withOpacity(0.8) 
-                                                : Colors.purple.withOpacity(0.8),
-                                            borderRadius: BorderRadius.circular(12),
-                                          ),
-                                          child: Text(
-                                            item.mediaType == 'movie' ? 'Film' : 'TV',
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                              fontSize: 10,
-                                              fontWeight: FontWeight.bold,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                      
-                                      // Se la serie TV, badge con numero episodi
-                                      if (item.mediaType == 'tv')
-                                        Positioned(
-                                          top: 8,
-                                          left: 8,
-                                          child: FutureBuilder<int>(
-                                            future: _getEpisodeCount(item.id),
-                                            builder: (context, snapshot) {
-                                              if (!snapshot.hasData || snapshot.data == 0) {
-                                                return const SizedBox.shrink();
-                                              }
-                                              return Container(
-                                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                                decoration: BoxDecoration(
-                                                  color: Colors.black.withOpacity(0.8),
-                                                  borderRadius: BorderRadius.circular(12),
-                                                ),
-                                                child: Text(
-                                                  '${snapshot.data} ep',
-                                                  style: const TextStyle(
-                                                    color: Colors.white,
-                                                    fontSize: 10,
-                                                    fontWeight: FontWeight.bold,
-                                                  ),
-                                                ),
-                                              );
-                                            },
-                                          ),
-                                        ),
-                                    ],
+                                      );
+                                    },
+                                    childCount: items.length,
                                   ),
                                 ),
-                              );
-                            },
+                              ),
+                            ],
                           ),
           ),
         ],
