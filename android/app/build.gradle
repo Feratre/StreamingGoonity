@@ -1,0 +1,111 @@
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+
+def flutterRoot = localProperties.getProperty('flutter.sdk')
+if (flutterRoot == null) {
+    throw new GradleException("Flutter SDK not found. Define location with flutter.sdk in the local.properties file.")
+}
+
+def flutterVersionCode = localProperties.getProperty('flutter.versionCode')
+if (flutterVersionCode == null) {
+    flutterVersionCode = '1'
+}
+
+def flutterVersionName = localProperties.getProperty('flutter.versionName')
+if (flutterVersionName == null) {
+    flutterVersionName = '1.0'
+}
+
+apply plugin: 'com.android.application'
+apply plugin: 'kotlin-android'
+apply from: "$flutterRoot/packages/flutter_tools/gradle/flutter.gradle"
+
+android {
+    namespace "com.example.smartroute"
+    compileSdkVersion flutter.compileSdkVersion
+    ndkVersion flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+        // Importante: questa linea abilita il desugaring
+        coreLibraryDesugaringEnabled true
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        // TODO: Specificare l'applicazione ID corretto
+        applicationId "com.example.smartroute"
+        // Puoi cambiare il minSdkVersion a 21 o superiore se necessario
+        minSdkVersion 21
+        targetSdkVersion flutter.targetSdkVersion
+        versionCode flutterVersionCode.toInteger()
+        versionName flutterVersionName
+        multiDexEnabled true
+    }
+
+    buildTypes {
+        release {
+            // TODO: Aggiungere le configurazioni di firma per l'app release
+            signingConfig signingConfigs.debug
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            // Per ridurre i tempi di build durante lo sviluppo
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    // Aggiungi questa configurazione se stai utilizzando Google Maps o altri servizi Google
+    flavorDimensions "default"
+    productFlavors {
+        production {
+            dimension "default"
+            applicationIdSuffix ""
+            versionNameSuffix ""
+        }
+        development {
+            dimension "default"
+            applicationIdSuffix ".dev"
+            versionNameSuffix "-dev"
+        }
+    }
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    
+    // Importante: questa linea abilita il desugaring delle librerie core di Java 8
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:1.1.5'
+    
+    // Supporto per multidex (in caso di superamento del limite di metodi)
+    implementation 'androidx.multidex:multidex:2.0.1'
+    
+    // Firebase (se lo stai utilizzando)
+    // implementation platform('com.google.firebase:firebase-bom:31.2.3')
+    // implementation 'com.google.firebase:firebase-analytics'
+    
+    // Aggiungi altre dipendenze specifiche del progetto se necessario
+}
+
+// Aggiungi il plugin Google Services se utilizzi Firebase
+// apply plugin: 'com.google.gms.google-services'
