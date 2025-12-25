@@ -1,6 +1,6 @@
 name: StreamingAir
 description: "StreamingAir."
-publish_to: 'none'
+publish_to: "none"
 version: 1.0.0+1
 
 environment:
@@ -15,12 +15,11 @@ dependencies:
   shared_preferences: ^2.2.2
   webview_flutter: ^4.4.2
   # Rimosso dio: ^5.3.2 (usato solo per il download)
-  path_provider: ^2.1.1  # Ancora usato per altre funzionalità
-  permission_handler: ^11.0.0  # Necessario per altre funzionalità
-  share_plus: ^7.0.0  # Usato altrove nell'app
+  path_provider: ^2.1.1 # Ancora usato per altre funzionalità
+  permission_handler: ^11.0.0 # Necessario per altre funzionalità
+  share_plus: ^7.0.0 # Usato altrove nell'app
   package_info_plus: ^4.0.0
-  
-  
+
   # Firebase
   firebase_core: ^2.15.1
   firebase_auth: ^4.7.3
@@ -34,9 +33,9 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  
+
   assets:
-    - assets/images/
+    - assets/icon/
 
 flutter_icons:
   android: true
