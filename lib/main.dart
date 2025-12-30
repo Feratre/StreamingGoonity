@@ -11,6 +11,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 import 'dart:io';
 import 'services/version_checker.dart';
+import 'app_theme.dart';
 
 // Modello per i dati del catalogo
 class CatalogItem {
@@ -1557,6 +1558,9 @@ class CatalogService {
   Map<int, String> tvGenres = {};
   bool _hasLoadedGenres = false;
 
+  // Getter per genreMaps (per uso esterno)
+  List<Map<int, String>> get genreMaps => [movieGenres, tvGenres];
+
   // Getter per i dati basati sul tipo selezionato
   String getSearchQuery(String type) =>
       type == 'movie' ? _movieSearchQuery : _tvSearchQuery;
@@ -2067,6 +2071,116 @@ class SavedContentManager {
     } catch (e) {
       print('Errore nel recupero: $e');
       return [];
+    }
+  }
+}
+
+// Manager per le selezioni della Principessa 💖
+class PrincessSelectionsManager {
+  static const String _princessMoviesKey = 'princess_movies';
+  static const String _princessTvKey = 'princess_tv';
+  static const String _princessInitializedKey = 'princess_initialized_v2';
+
+  // ID predefiniti della Principessa
+  static final List<int> _defaultMovies = [
+    447362, // Life in a Year
+    32657, // Percy Jackson e gli dei dell'Olimpo - Il ladro di fulmini
+    76285, // Percy Jackson e gli Dei dell'Olimpo - Il mare dei mostri
+    877703, // Teen Wolf - Il film
+    957119, // Sidelined: The QB and Me
+    1072790, // Tutti tranne te (Anyone But You)
+    1246049, // Dracula - L'amore perduto
+    60695, // Domeniche da Tiffany
+    4951, // 10 cose che odio di te
+  ];
+
+  static final List<int> _defaultTv = [
+    34524, // Teen Wolf
+    85552, // Euphoria
+    2288, // Prison Break
+  ];
+
+  // Inizializza le selezioni con i valori predefiniti (forza reset se prima versione)
+  static Future<void> initialize() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // Controlla se è già stata inizializzata la versione corrente
+    final isInitialized = prefs.getBool(_princessInitializedKey) ?? false;
+
+    if (!isInitialized) {
+      // Forza l'inizializzazione con i valori predefiniti
+      await prefs.setStringList(
+        _princessMoviesKey,
+        _defaultMovies.map((id) => id.toString()).toList(),
+      );
+      await prefs.setStringList(
+        _princessTvKey,
+        _defaultTv.map((id) => id.toString()).toList(),
+      );
+      await prefs.setBool(_princessInitializedKey, true);
+    }
+  }
+
+  // Ottieni tutti gli ID dei film della Principessa
+  static Future<List<int>> getMovieIds() async {
+    final prefs = await SharedPreferences.getInstance();
+    final list =
+        prefs.getStringList(_princessMoviesKey) ??
+        _defaultMovies.map((id) => id.toString()).toList();
+    return list.map((s) => int.parse(s)).toList();
+  }
+
+  // Ottieni tutti gli ID delle serie TV della Principessa
+  static Future<List<int>> getTvIds() async {
+    final prefs = await SharedPreferences.getInstance();
+    final list =
+        prefs.getStringList(_princessTvKey) ??
+        _defaultTv.map((id) => id.toString()).toList();
+    return list.map((s) => int.parse(s)).toList();
+  }
+
+  // Controlla se un elemento è nella lista della Principessa
+  static Future<bool> isPrincessSelection(int id, String mediaType) async {
+    if (mediaType == 'movie') {
+      final ids = await getMovieIds();
+      return ids.contains(id);
+    } else {
+      final ids = await getTvIds();
+      return ids.contains(id);
+    }
+  }
+
+  // Aggiungi un elemento alla lista della Principessa
+  static Future<bool> addToPrincessList(int id, String mediaType) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = mediaType == 'movie' ? _princessMoviesKey : _princessTvKey;
+
+      List<String> list = prefs.getStringList(key) ?? [];
+      if (!list.contains(id.toString())) {
+        list.add(id.toString());
+        await prefs.setStringList(key, list);
+      }
+      return true;
+    } catch (e) {
+      print('Errore aggiunta Princess: $e');
+      return false;
+    }
+  }
+
+  // Rimuovi un elemento dalla lista della Principessa
+  static Future<bool> removeFromPrincessList(int id, String mediaType) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final key = mediaType == 'movie' ? _princessMoviesKey : _princessTvKey;
+
+      List<String> list = prefs.getStringList(key) ?? [];
+      list.remove(id.toString());
+      await prefs.setStringList(key, list);
+      return true;
+    } catch (e) {
+      print('Errore rimozione Princess: $e');
+      return false;
     }
   }
 }
@@ -2628,6 +2742,14 @@ class _CatalogPageState extends State<CatalogPage> {
   final TextEditingController _searchController = TextEditingController();
   String _selectedType = 'movie'; // Default a film
   final FocusNode _searchFocusNode = FocusNode();
+  bool _isPrincessMode = false; // Modalità catalogo speciale Principessa
+
+  // Lista dei contenuti della Principessa caricati
+  List<CatalogItem> _princessItems = [];
+  bool _isPrincessLoading = false;
+
+  // Animazione per il catalogo Principessa
+  double _princessAnimationValue = 0.0;
 
   @override
   void initState() {
@@ -2667,12 +2789,16 @@ class _CatalogPageState extends State<CatalogPage> {
 
   // Carica il catalogo
   Future<void> _loadCatalog() async {
-    await _catalogService.fetchCatalogIds(_selectedType, setState);
+    await _catalogService.fetchCatalogIds(_selectedType, (fn) {
+      if (mounted) setState(fn);
+    });
   }
 
   // Carica più titoli
   Future<void> _loadMore() async {
-    await _catalogService.loadMoreTitles(_selectedType, setState);
+    await _catalogService.loadMoreTitles(_selectedType, (fn) {
+      if (mounted) setState(fn);
+    });
   }
 
   // Esegue una ricerca
@@ -2690,6 +2816,111 @@ class _CatalogPageState extends State<CatalogPage> {
 
     // Esegui la ricerca
     await _catalogService.searchInCatalog(query, _selectedType, setState);
+  }
+
+  // Carica i contenuti scelti dalla Principessa
+  Future<void> _loadPrincessContent() async {
+    // Ottieni gli ID dalla memoria persistente
+    final movieIds = await PrincessSelectionsManager.getMovieIds();
+    final tvIds = await PrincessSelectionsManager.getTvIds();
+
+    if (movieIds.isEmpty && tvIds.isEmpty) {
+      setState(() {
+        _princessItems = [];
+        _isPrincessLoading = false;
+      });
+      return;
+    }
+
+    setState(() {
+      _isPrincessLoading = true;
+    });
+
+    List<CatalogItem> items = [];
+
+    try {
+      // Carica i film della Principessa
+      for (int id in movieIds) {
+        try {
+          final response = await http.get(
+            Uri.parse(
+              'https://api.themoviedb.org/3/movie/$id?api_key=${CatalogService.apiKey}&language=it-IT',
+            ),
+          );
+          if (response.statusCode == 200) {
+            final data = json.decode(response.body);
+            items.add(
+              CatalogItem.fromTmdbJson(
+                data,
+                'movie',
+                _catalogService.genreMaps,
+              ),
+            );
+          }
+        } catch (e) {
+          print('Errore caricamento film $id: $e');
+        }
+      }
+
+      // Carica le serie TV della Principessa
+      for (int id in tvIds) {
+        try {
+          final response = await http.get(
+            Uri.parse(
+              'https://api.themoviedb.org/3/tv/$id?api_key=${CatalogService.apiKey}&language=it-IT',
+            ),
+          );
+          if (response.statusCode == 200) {
+            final data = json.decode(response.body);
+            items.add(
+              CatalogItem.fromTmdbJson(data, 'tv', _catalogService.genreMaps),
+            );
+          }
+        } catch (e) {
+          print('Errore caricamento serie $id: $e');
+        }
+      }
+    } catch (e) {
+      print('Errore generale caricamento Princess content: $e');
+    }
+
+    if (mounted) {
+      setState(() {
+        _princessItems = items;
+        _isPrincessLoading = false;
+      });
+    }
+  }
+
+  // Entra nel catalogo Principessa con animazione
+  void _enterPrincessMode() {
+    setState(() {
+      _isPrincessMode = true;
+      _princessAnimationValue = 0.0;
+    });
+    _loadPrincessContent();
+    // Animazione fade-in
+    Future.delayed(const Duration(milliseconds: 50), () {
+      if (mounted) {
+        setState(() {
+          _princessAnimationValue = 1.0;
+        });
+      }
+    });
+  }
+
+  // Esci dal catalogo Principessa
+  void _exitPrincessMode() {
+    setState(() {
+      _princessAnimationValue = 0.0;
+    });
+    Future.delayed(const Duration(milliseconds: 200), () {
+      if (mounted) {
+        setState(() {
+          _isPrincessMode = false;
+        });
+      }
+    });
   }
 
   // Naviga alla pagina di dettaglio
@@ -2720,6 +2951,11 @@ class _CatalogPageState extends State<CatalogPage> {
 
   @override
   Widget build(BuildContext context) {
+    // Se siamo in modalità Principessa, mostra il catalogo speciale
+    if (_isPrincessMode) {
+      return _buildPrincessCatalog();
+    }
+
     return Scaffold(
       backgroundColor: const Color(0xFF141420),
       appBar: AppBar(
@@ -2774,11 +3010,514 @@ class _CatalogPageState extends State<CatalogPage> {
             ),
           ),
 
+          const SizedBox(height: 12),
+
+          // Pulsante Principessa 💕
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+            child: _buildPrincessButton(),
+          ),
+
           const SizedBox(height: 16),
 
           // Contenuto principale
           Expanded(child: _buildContentList(_selectedType)),
         ],
+      ),
+    );
+  }
+
+  // Pulsante romantico per la Principessa
+  Widget _buildPrincessButton() {
+    return GestureDetector(
+      onTap: _enterPrincessMode,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 14),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [
+              Color(0xFFFF6B9D), // Rosa acceso
+              Color(0xFFE91E63), // Rosa più scuro
+              Color(0xFFFF4081), // Rosa vivace
+            ],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFFFF6B9D).withOpacity(0.4),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Stack(
+          children: [
+            // Rose decorative sparse nel background
+            Positioned(
+              top: 2,
+              left: 20,
+              child: Text(
+                '🌹',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.white.withOpacity(0.5),
+                ),
+              ),
+            ),
+            Positioned(
+              bottom: 2,
+              right: 30,
+              child: Text(
+                '🌹',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: Colors.white.withOpacity(0.4),
+                ),
+              ),
+            ),
+            Positioned(
+              top: 4,
+              right: 60,
+              child: Text(
+                '💕',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: Colors.white.withOpacity(0.5),
+                ),
+              ),
+            ),
+            Positioned(
+              bottom: 3,
+              left: 50,
+              child: Text(
+                '🌸',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Colors.white.withOpacity(0.4),
+                ),
+              ),
+            ),
+            Positioned(
+              top: 3,
+              right: 15,
+              child: Text(
+                '🌸',
+                style: TextStyle(
+                  fontSize: 9,
+                  color: Colors.white.withOpacity(0.5),
+                ),
+              ),
+            ),
+            Positioned(
+              bottom: 2,
+              left: 80,
+              child: Text(
+                '💕',
+                style: TextStyle(
+                  fontSize: 9,
+                  color: Colors.white.withOpacity(0.4),
+                ),
+              ),
+            ),
+            // Testo principale
+            Center(
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Text('💖', style: TextStyle(fontSize: 16)),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Scelti dalla mia Principessa',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                      letterSpacing: 0.5,
+                      shadows: [
+                        Shadow(
+                          color: Colors.black26,
+                          offset: Offset(0, 1),
+                          blurRadius: 2,
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  const Text('💖', style: TextStyle(fontSize: 16)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Costruisce il catalogo speciale della Principessa
+  Widget _buildPrincessCatalog() {
+    return AnimatedOpacity(
+      opacity: _princessAnimationValue,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
+      child: AnimatedScale(
+        scale: 0.95 + (0.05 * _princessAnimationValue),
+        duration: const Duration(milliseconds: 300),
+        curve: Curves.easeOutBack,
+        child: Scaffold(
+          backgroundColor: const Color(0xFF141420),
+          appBar: AppBar(
+            backgroundColor: const Color(0xFF141420),
+            elevation: 0,
+            leading: IconButton(
+              icon: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFF6B9D).withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(
+                  Icons.arrow_back_ios_new,
+                  color: Color(0xFFFF6B9D),
+                  size: 20,
+                ),
+              ),
+              onPressed: _exitPrincessMode,
+            ),
+            title: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: const [
+                Text('💖', style: TextStyle(fontSize: 18)),
+                SizedBox(width: 8),
+                Text(
+                  'Scelti dalla mia Principessa',
+                  style: TextStyle(
+                    color: Color(0xFFFF6B9D),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
+                  ),
+                ),
+                SizedBox(width: 8),
+                Text('💖', style: TextStyle(fontSize: 18)),
+              ],
+            ),
+            centerTitle: true,
+          ),
+          body: Container(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  const Color(0xFF141420),
+                  const Color(0xFF1a1525).withOpacity(0.95),
+                ],
+              ),
+            ),
+            child: Stack(
+              children: [
+                // Rose decorative sparse nello sfondo
+                ..._buildBackgroundRoses(),
+                // Contenuto principale
+                _buildPrincessContent(),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Rose decorative per lo sfondo del catalogo Principessa
+  List<Widget> _buildBackgroundRoses() {
+    return [
+      Positioned(
+        top: 50,
+        left: 20,
+        child: Opacity(
+          opacity: 0.15,
+          child: Text('🌹', style: TextStyle(fontSize: 24)),
+        ),
+      ),
+      Positioned(
+        top: 120,
+        right: 30,
+        child: Opacity(
+          opacity: 0.12,
+          child: Text('🌸', style: TextStyle(fontSize: 20)),
+        ),
+      ),
+      Positioned(
+        top: 200,
+        left: 60,
+        child: Opacity(
+          opacity: 0.1,
+          child: Text('💕', style: TextStyle(fontSize: 18)),
+        ),
+      ),
+      Positioned(
+        top: 300,
+        right: 50,
+        child: Opacity(
+          opacity: 0.13,
+          child: Text('🌹', style: TextStyle(fontSize: 22)),
+        ),
+      ),
+      Positioned(
+        top: 400,
+        left: 30,
+        child: Opacity(
+          opacity: 0.11,
+          child: Text('🌸', style: TextStyle(fontSize: 16)),
+        ),
+      ),
+      Positioned(
+        top: 500,
+        right: 20,
+        child: Opacity(
+          opacity: 0.14,
+          child: Text('💖', style: TextStyle(fontSize: 20)),
+        ),
+      ),
+      Positioned(
+        bottom: 150,
+        left: 40,
+        child: Opacity(
+          opacity: 0.12,
+          child: Text('🌹', style: TextStyle(fontSize: 18)),
+        ),
+      ),
+      Positioned(
+        bottom: 80,
+        right: 60,
+        child: Opacity(
+          opacity: 0.1,
+          child: Text('🌸', style: TextStyle(fontSize: 22)),
+        ),
+      ),
+      Positioned(
+        bottom: 200,
+        right: 25,
+        child: Opacity(
+          opacity: 0.13,
+          child: Text('💕', style: TextStyle(fontSize: 16)),
+        ),
+      ),
+    ];
+  }
+
+  // Contenuto del catalogo Principessa
+  Widget _buildPrincessContent() {
+    if (_isPrincessLoading) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const CircularProgressIndicator(color: Color(0xFFFF6B9D)),
+            const SizedBox(height: 20),
+            Text(
+              'Caricamento selezioni speciali...',
+              style: TextStyle(color: Colors.grey[400], fontSize: 16),
+            ),
+            const SizedBox(height: 8),
+            const Text('💖', style: TextStyle(fontSize: 24)),
+          ],
+        ),
+      );
+    }
+
+    if (_princessItems.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Text('💕', style: TextStyle(fontSize: 48)),
+            const SizedBox(height: 16),
+            Text(
+              'Nessuna selezione ancora',
+              style: TextStyle(fontSize: 18, color: Colors.grey[400]),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'La Principessa non ha ancora scelto i suoi preferiti',
+              style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      );
+    }
+
+    return GridView.builder(
+      padding: const EdgeInsets.all(12),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 2,
+        childAspectRatio: 0.7,
+        crossAxisSpacing: 16,
+        mainAxisSpacing: 16,
+      ),
+      itemCount: _princessItems.length,
+      itemBuilder: (context, index) {
+        final item = _princessItems[index];
+        return _buildPrincessItemCard(item);
+      },
+    );
+  }
+
+  // Card speciale per il catalogo Principessa (con bordo rosa)
+  Widget _buildPrincessItemCard(CatalogItem item) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F2133),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: const Color(0xFFFF6B9D).withOpacity(0.3),
+          width: 1.5,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFFFF6B9D).withOpacity(0.1),
+            blurRadius: 8,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () => _navigateToDetailPage(item),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Poster
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  Hero(
+                    tag: 'poster_${item.id}_${item.mediaType}_princess',
+                    child: item.posterPath != null
+                        ? Image.network(
+                            'https://image.tmdb.org/t/p/w342${item.posterPath}',
+                            fit: BoxFit.cover,
+                            errorBuilder: (context, error, stackTrace) =>
+                                Container(
+                                  color: const Color(0xFF262942),
+                                  child: const Icon(
+                                    Icons.image_not_supported,
+                                    size: 40,
+                                    color: Colors.grey,
+                                  ),
+                                ),
+                          )
+                        : Container(
+                            color: const Color(0xFF262942),
+                            child: const Icon(
+                              Icons.movie,
+                              size: 40,
+                              color: Colors.grey,
+                            ),
+                          ),
+                  ),
+
+                  // Gradiente scuro in basso
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 0,
+                    height: 60,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.transparent,
+                            Colors.black.withOpacity(0.8),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // Cuoricino in alto a sinistra
+                  Positioned(
+                    top: 8,
+                    left: 8,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFF6B9D).withOpacity(0.8),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Text('💖', style: TextStyle(fontSize: 12)),
+                    ),
+                  ),
+
+                  if (item.voteAverage != null)
+                    Positioned(
+                      top: 8,
+                      right: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.6),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.star,
+                              color: Colors.amber,
+                              size: 14,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              item.voteAverage!.toStringAsFixed(1),
+                              style: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+
+            // Titolo e anno
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    item.title,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  if (item.releaseDate != null && item.releaseDate!.isNotEmpty)
+                    Text(
+                      item.releaseDate!.length >= 4
+                          ? item.releaseDate!.substring(0, 4)
+                          : item.releaseDate!,
+                      style: TextStyle(fontSize: 12, color: Colors.grey[400]),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -3372,10 +4111,15 @@ class _DetailPageState extends State<DetailPage>
   int? movieRuntime; // Per memorizzare la durata del film
   double? savedPosition; // Per mostrare la posizione salvata
 
+  // Stato per la lista della Principessa 💖
+  bool isPrincessSelection = false;
+  bool isCheckingPrincess = true;
+
   @override
   void initState() {
     super.initState();
     _checkIfSaved();
+    _checkIfPrincessSelection();
     _loadSavedPosition();
 
     // Se è un film, carica i dettagli aggiuntivi come la durata
@@ -3443,6 +4187,69 @@ class _DetailPageState extends State<DetailPage>
         isSaved = saved;
         isCheckingSaved = false;
       });
+    }
+  }
+
+  // Controlla se l'elemento è nella lista della Principessa 💖
+  Future<void> _checkIfPrincessSelection() async {
+    final isPrincess = await PrincessSelectionsManager.isPrincessSelection(
+      widget.item.id,
+      widget.item.mediaType,
+    );
+    if (mounted) {
+      setState(() {
+        isPrincessSelection = isPrincess;
+        isCheckingPrincess = false;
+      });
+    }
+  }
+
+  // Aggiungi o rimuovi dalla lista della Principessa 💖
+  Future<void> _togglePrincessSelection() async {
+    if (isPrincessSelection) {
+      // Rimuovi dalla lista della Principessa
+      final success = await PrincessSelectionsManager.removeFromPrincessList(
+        widget.item.id,
+        widget.item.mediaType,
+      );
+      if (success && mounted) {
+        setState(() {
+          isPrincessSelection = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                Text('💔 '),
+                Text('Rimosso dalla lista della Principessa'),
+              ],
+            ),
+            backgroundColor: Color(0xFFFF6B9D),
+          ),
+        );
+      }
+    } else {
+      // Aggiungi alla lista della Principessa
+      final success = await PrincessSelectionsManager.addToPrincessList(
+        widget.item.id,
+        widget.item.mediaType,
+      );
+      if (success && mounted) {
+        setState(() {
+          isPrincessSelection = true;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Row(
+              children: [
+                Text('💖 '),
+                Text('Aggiunto alla lista della Principessa!'),
+              ],
+            ),
+            backgroundColor: Color(0xFFFF6B9D),
+          ),
+        );
+      }
     }
   }
 
@@ -4075,10 +4882,155 @@ class _DetailPageState extends State<DetailPage>
                     Share.share(text);
                   },
                 ),
+                const SizedBox(height: 12),
+                // Pulsante Principessa 💖
+                _buildPrincessButton(),
               ],
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  // Costruisce il pulsante della Principessa 💖
+  Widget _buildPrincessButton() {
+    if (isCheckingPrincess) {
+      return Container(
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [Color(0xFFFF6B9D), Color(0xFFE91E63)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(
+              color: Colors.white,
+              strokeWidth: 2,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return GestureDetector(
+      onTap: _togglePrincessSelection,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        decoration: BoxDecoration(
+          gradient: isPrincessSelection
+              ? const LinearGradient(
+                  colors: [
+                    Color(0xFFFF6B9D),
+                    Color(0xFFE91E63),
+                    Color(0xFFFF4081),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                )
+              : null,
+          color: isPrincessSelection ? null : const Color(0xFF1F2133),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: const Color(0xFFFF6B9D),
+            width: isPrincessSelection ? 0 : 1.5,
+          ),
+          boxShadow: isPrincessSelection
+              ? [
+                  BoxShadow(
+                    color: const Color(0xFFFF6B9D).withOpacity(0.4),
+                    blurRadius: 12,
+                    offset: const Offset(0, 4),
+                  ),
+                ]
+              : null,
+        ),
+        child: Stack(
+          children: [
+            // Rose decorative sparse (solo se è già nella lista)
+            if (isPrincessSelection) ...[
+              Positioned(
+                top: 4,
+                left: 20,
+                child: Text(
+                  '🌹',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: Colors.white.withOpacity(0.5),
+                  ),
+                ),
+              ),
+              Positioned(
+                bottom: 4,
+                right: 30,
+                child: Text(
+                  '🌸',
+                  style: TextStyle(
+                    fontSize: 9,
+                    color: Colors.white.withOpacity(0.4),
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 3,
+                right: 50,
+                child: Text(
+                  '💕',
+                  style: TextStyle(
+                    fontSize: 8,
+                    color: Colors.white.withOpacity(0.5),
+                  ),
+                ),
+              ),
+            ],
+            // Contenuto principale
+            Center(
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    isPrincessSelection ? '💖' : '🤍',
+                    style: const TextStyle(fontSize: 18),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    isPrincessSelection
+                        ? 'Nella lista della Principessa'
+                        : 'Aggiungi alla lista Principessa',
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
+                      color: isPrincessSelection
+                          ? Colors.white
+                          : const Color(0xFFFF6B9D),
+                      shadows: isPrincessSelection
+                          ? const [
+                              Shadow(
+                                color: Colors.black26,
+                                offset: Offset(0, 1),
+                                blurRadius: 2,
+                              ),
+                            ]
+                          : null,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    isPrincessSelection ? '💖' : '🤍',
+                    style: const TextStyle(fontSize: 18),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -4948,28 +5900,50 @@ class _MainPageState extends State<MainPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: _pages[_selectedIndex],
+      body: AnimatedSwitcher(
+        duration: AppTheme.animationDuration,
+        transitionBuilder: (child, animation) {
+          return FadeTransition(
+            opacity: animation,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0.1, 0),
+                end: Offset.zero,
+              ).animate(animation),
+              child: child,
+            ),
+          );
+        },
+        child: _pages[_selectedIndex],
+      ),
       bottomNavigationBar: Container(
         decoration: BoxDecoration(
-          color: const Color(0xFF1F2133),
+          gradient: LinearGradient(
+            colors: [
+              AppTheme.surfaceColor,
+              AppTheme.surfaceColor.withOpacity(0.95),
+            ],
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+          ),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(0.2),
-              blurRadius: 10,
+              color: Colors.black.withOpacity(0.3),
+              blurRadius: 20,
               offset: const Offset(0, -5),
             ),
           ],
         ),
         child: SafeArea(
           child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+            padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
               children: [
-                _buildNavItem(0, Icons.search, 'Cerca'),
-                _buildNavItem(1, Icons.movie, 'Catalogo'),
-                _buildNavItem(2, Icons.bookmark, 'Salvati'),
-                _buildNavItem(3, Icons.person, 'Account'),
+                _buildNavItem(0, Icons.search_rounded, 'Cerca'),
+                _buildNavItem(1, Icons.movie_outlined, 'Catalogo'),
+                _buildNavItem(2, Icons.bookmark_outline, 'Salvati'),
+                _buildNavItem(3, Icons.person_outline, 'Account'),
               ],
             ),
           ),
@@ -4980,34 +5954,63 @@ class _MainPageState extends State<MainPage> {
 
   Widget _buildNavItem(int index, IconData icon, String label) {
     final isSelected = _selectedIndex == index;
-    return InkWell(
-      onTap: () => _onItemTapped(index),
-      borderRadius: BorderRadius.circular(16),
+    return Expanded(
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         decoration: BoxDecoration(
-          color: isSelected
-              ? const Color(0xFF5E72E4).withOpacity(0.1)
-              : Colors.transparent,
-          borderRadius: BorderRadius.circular(16),
+          boxShadow: isSelected
+              ? [
+                  BoxShadow(
+                    color: AppTheme.primaryColor.withOpacity(0.4),
+                    blurRadius: 12,
+                    offset: const Offset(0, 4),
+                  ),
+                ]
+              : null,
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              icon,
-              color: isSelected ? const Color(0xFF5E72E4) : Colors.grey,
+        child: InkWell(
+          onTap: () => _onItemTapped(index),
+          borderRadius: BorderRadius.circular(20),
+          child: AnimatedContainer(
+            duration: AppTheme.animationDuration,
+            curve: AppTheme.springCurve,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              gradient: isSelected
+                  ? AppTheme.primaryGradient
+                  : const LinearGradient(
+                      colors: [Colors.transparent, Colors.transparent],
+                    ),
+              borderRadius: BorderRadius.circular(20),
             ),
-            const SizedBox(height: 4),
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12,
-                color: isSelected ? const Color(0xFF5E72E4) : Colors.grey,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-              ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                AnimatedScale(
+                  scale: isSelected ? 1.1 : 1.0,
+                  duration: AppTheme.animationDuration,
+                  curve: AppTheme.springCurve,
+                  child: Icon(
+                    icon,
+                    color: isSelected ? Colors.white : Colors.grey,
+                    size: 26,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                AnimatedDefaultTextStyle(
+                  duration: AppTheme.animationDuration,
+                  curve: AppTheme.animationCurve,
+                  style: TextStyle(
+                    color: isSelected ? Colors.white : Colors.grey,
+                    fontSize: isSelected ? 12 : 11,
+                    fontWeight: isSelected
+                        ? FontWeight.w600
+                        : FontWeight.normal,
+                  ),
+                  child: Text(label),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -5046,16 +6049,15 @@ class _AuthWrapperState extends State<AuthWrapper> {
   Widget build(BuildContext context) {
     if (!_initialized) {
       return MaterialApp(
-        theme: ThemeData.dark().copyWith(
-          scaffoldBackgroundColor: const Color(0xFF141420),
-          colorScheme: const ColorScheme.dark(
-            primary: Color(0xFF5E72E4),
-            secondary: Color(0xFF5E72E4),
-          ),
-        ),
-        home: const Scaffold(
-          body: Center(
-            child: CircularProgressIndicator(color: Color(0xFF5E72E4)),
+        theme: AppTheme.darkTheme,
+        home: Scaffold(
+          body: Container(
+            decoration: const BoxDecoration(
+              gradient: AppTheme.backgroundGradient,
+            ),
+            child: const Center(
+              child: CircularProgressIndicator(color: AppTheme.primaryColor),
+            ),
           ),
         ),
         debugShowCheckedModeBanner: false,
@@ -5064,17 +6066,7 @@ class _AuthWrapperState extends State<AuthWrapper> {
 
     return MaterialApp(
       title: 'RedaMovie',
-      theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF141420),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFF141420),
-          elevation: 0,
-        ),
-        colorScheme: const ColorScheme.dark(
-          primary: Color(0xFF5E72E4),
-          secondary: Color(0xFF5E72E4),
-        ),
-      ),
+      theme: AppTheme.darkTheme,
       home: AuthService.isLoggedIn ? widget.child : const LoginScreen(),
       debugShowCheckedModeBanner: false,
     );
@@ -5137,8 +6129,12 @@ class _AuthenticationGateState extends State<_AuthenticationGate> {
 }
 
 // Entry point dell'applicazione
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Inizializza le selezioni della Principessa 💖
+  await PrincessSelectionsManager.initialize();
+
   runApp(const MyApp());
 }
 
